@@ -1,9 +1,8 @@
 //===--- AtomicChange.h - AtomicChange class --------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -71,7 +70,7 @@ public:
   /// conflicts among replacements, use this to set an error description.
   /// Thereby, places that cannot be fixed automatically can be gathered when
   /// applying changes.
-  void setError(llvm::StringRef Error) { this->Error = Error; }
+  void setError(llvm::StringRef Error) { this->Error = std::string(Error); }
 
   /// Returns whether an error has been set on this list.
   bool hasError() const { return !Error.empty(); }

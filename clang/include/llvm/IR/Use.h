@@ -1,9 +1,8 @@
 //===- llvm/Use.h - Definition of the Use class -----------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 /// \file
@@ -70,7 +69,7 @@ public:
       return (User *)P;
     }
 
-    enum { NumLowBitsAvailable = 1 };
+    static constexpr int NumLowBitsAvailable = 1;
   };
 
   // A type for the word following an array of hung-off Uses in memory, which is
@@ -86,7 +85,7 @@ public:
       return (Use **)P;
     }
 
-    enum { NumLowBitsAvailable = 2 };
+    static constexpr int NumLowBitsAvailable = 2;
   };
 
 private:
@@ -140,7 +139,7 @@ private:
   const Use *getImpliedUser() const LLVM_READONLY;
 
   Value *Val = nullptr;
-  Use *Next;
+  Use *Next = nullptr;
   PointerIntPair<Use **, 2, PrevPtrTag, PrevPointerTraits> Prev;
 
   void setPrev(Use **NewPrev) { Prev.setPointer(NewPrev); }

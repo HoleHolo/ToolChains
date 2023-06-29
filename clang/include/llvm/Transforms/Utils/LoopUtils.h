@@ -1,9 +1,8 @@
 //===- llvm/Transforms/Utils/LoopUtils.h - Loop utilities -------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,6 +15,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Optional.h"
+#include "llvm/ADT/PriorityWorklist.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -41,16 +41,20 @@ class BasicBlock;
 class DataLayout;
 class Loop;
 class LoopInfo;
+class MemoryAccess;
+class MemorySSA;
+class MemorySSAUpdater;
 class OptimizationRemarkEmitter;
 class PredicatedScalarEvolution;
 class PredIteratorCache;
 class ScalarEvolution;
 class SCEV;
+class SCEVExpander;
 class TargetLibraryInfo;
 class TargetTransformInfo;
 
 BasicBlock *InsertPreheaderForLoop(Loop *L, DominatorTree *DT, LoopInfo *LI,
-                                   bool PreserveLCSSA);
+                                   MemorySSAUpdater *MSSAU, bool PreserveLCSSA);
 
 /// Ensure that all exit blocks of the loop are dedicated exits.
 ///
@@ -58,7 +62,7 @@ BasicBlock *InsertPreheaderForLoop(Loop *L, DominatorTree *DT, LoopInfo *LI,
 /// predecessors to use a dedicated loop exit block. We update the dominator
 /// tree and loop info if provided, and will preserve LCSSA if requested.
 bool formDedicatedExitBlocks(Loop *L, DominatorTree *DT, LoopInfo *LI,
-                             bool PreserveLCSSA);
+                             MemorySSAUpdater *MSSAU, bool PreserveLCSSA);
 
 /// Ensures LCSSA form for every instruction from the Worklist in the scope of
 /// innermost containing loop.
@@ -72,13 +76,15 @@ bool formDedicatedExitBlocks(Loop *L, DominatorTree *DT, LoopInfo *LI,
 ///
 /// Returns true if any modifications are made.
 bool formLCSSAForInstructions(SmallVectorImpl<Instruction *> &Worklist,
-                              DominatorTree &DT, LoopInfo &LI);
+                              DominatorTree &DT, LoopInfo &LI,
+                              ScalarEvolution *SE);
 
 /// Put loop into LCSSA form.
 ///
 /// Looks at all instructions in the loop which have uses outside of the
 /// current loop. For each, an LCSSA PHI node is inserted and the uses outside
-/// the loop are rewritten to use this node.
+/// the loop are rewritten to use this node. Sub-loops must be in LCSSA form
+/// already.
 ///
 /// LoopInfo and DominatorTree are required and preserved.
 ///
@@ -99,6 +105,14 @@ bool formLCSSA(Loop &L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution *SE);
 bool formLCSSARecursively(Loop &L, DominatorTree &DT, LoopInfo *LI,
                           ScalarEvolution *SE);
 
+struct SinkAndHoistLICMFlags {
+  bool NoOfMemAccTooLarge;
+  unsigned LicmMssaOptCounter;
+  unsigned LicmMssaOptCap;
+  unsigned LicmMssaNoAccForPromotionCap;
+  bool IsSink;
+};
+
 /// Walk the specified region of the CFG (defined by all blocks
 /// dominated by the specified block, and that are in the current loop) in
 /// reverse depth first order w.r.t the DominatorTree. This allows us to visit
@@ -109,8 +123,8 @@ bool formLCSSARecursively(Loop &L, DominatorTree &DT, LoopInfo *LI,
 /// arguments. Diagnostics is emitted via \p ORE. It returns changed status.
 bool sinkRegion(DomTreeNode *, AliasAnalysis *, LoopInfo *, DominatorTree *,
                 TargetLibraryInfo *, TargetTransformInfo *, Loop *,
-                AliasSetTracker *, ICFLoopSafetyInfo *,
-                OptimizationRemarkEmitter *ORE);
+                AliasSetTracker *, MemorySSAUpdater *, ICFLoopSafetyInfo *,
+                SinkAndHoistLICMFlags &, OptimizationRemarkEmitter *);
 
 /// Walk the specified region of the CFG (defined by all blocks
 /// dominated by the specified block, and that are in the current loop) in depth
@@ -122,7 +136,8 @@ bool sinkRegion(DomTreeNode *, AliasAnalysis *, LoopInfo *, DominatorTree *,
 /// ORE. It returns changed status.
 bool hoistRegion(DomTreeNode *, AliasAnalysis *, LoopInfo *, DominatorTree *,
                  TargetLibraryInfo *, Loop *, AliasSetTracker *,
-                 ICFLoopSafetyInfo *, OptimizationRemarkEmitter *ORE);
+                 MemorySSAUpdater *, ScalarEvolution *, ICFLoopSafetyInfo *,
+                 SinkAndHoistLICMFlags &, OptimizationRemarkEmitter *);
 
 /// This function deletes dead loops. The caller of this function needs to
 /// guarantee that the loop is infact dead.
@@ -131,12 +146,12 @@ bool hoistRegion(DomTreeNode *, AliasAnalysis *, LoopInfo *, DominatorTree *,
 ///   - The loop needs to have a Preheader
 ///   - A unique dedicated exit block must exist
 ///
-/// This also updates the relevant analysis information in \p DT, \p SE, and \p
-/// LI if pointers to those are provided.
+/// This also updates the relevant analysis information in \p DT, \p SE, \p LI
+/// and \p MSSA if pointers to those are provided.
 /// It also updates the loop PM if an updater struct is provided.
 
 void deleteDeadLoop(Loop *L, DominatorTree *DT, ScalarEvolution *SE,
-                    LoopInfo *LI);
+                    LoopInfo *LI, MemorySSA *MSSA = nullptr);
 
 /// Try to promote memory values to scalars by sinking stores out of
 /// the loop and moving loads to before the loop.  We do this by looping over
@@ -146,14 +161,12 @@ void deleteDeadLoop(Loop *L, DominatorTree *DT, ScalarEvolution *SE,
 /// LoopInfo, DominatorTree, Loop, AliasSet information for all instructions
 /// of the loop and loop safety information as arguments.
 /// Diagnostics is emitted via \p ORE. It returns changed status.
-bool promoteLoopAccessesToScalars(const SmallSetVector<Value *, 8> &,
-                                  SmallVectorImpl<BasicBlock *> &,
-                                  SmallVectorImpl<Instruction *> &,
-                                  PredIteratorCache &, LoopInfo *,
-                                  DominatorTree *, const TargetLibraryInfo *,
-                                  Loop *, AliasSetTracker *,
-                                  ICFLoopSafetyInfo *,
-                                  OptimizationRemarkEmitter *);
+bool promoteLoopAccessesToScalars(
+    const SmallSetVector<Value *, 8> &, SmallVectorImpl<BasicBlock *> &,
+    SmallVectorImpl<Instruction *> &, SmallVectorImpl<MemoryAccess *> &,
+    PredIteratorCache &, LoopInfo *, DominatorTree *, const TargetLibraryInfo *,
+    Loop *, AliasSetTracker *, MemorySSAUpdater *, ICFLoopSafetyInfo *,
+    OptimizationRemarkEmitter *);
 
 /// Does a BFS from a given node to all of its children inside a given loop.
 /// The returned vector of nodes includes the starting point.
@@ -168,17 +181,105 @@ SmallVector<Instruction *, 8> findDefsUsedOutsideOfLoop(Loop *L);
 /// If it has a value (e.g. {"llvm.distribute", 1} return the value as an
 /// operand or null otherwise.  If the string metadata is not found return
 /// Optional's not-a-value.
-Optional<const MDOperand *> findStringMetadataForLoop(Loop *TheLoop,
+Optional<const MDOperand *> findStringMetadataForLoop(const Loop *TheLoop,
                                                       StringRef Name);
 
+/// Find named metadata for a loop with an integer value.
+llvm::Optional<int> getOptionalIntLoopAttribute(Loop *TheLoop, StringRef Name);
+
+/// Create a new loop identifier for a loop created from a loop transformation.
+///
+/// @param OrigLoopID The loop ID of the loop before the transformation.
+/// @param FollowupAttrs List of attribute names that contain attributes to be
+///                      added to the new loop ID.
+/// @param InheritOptionsAttrsPrefix Selects which attributes should be inherited
+///                                  from the original loop. The following values
+///                                  are considered:
+///        nullptr   : Inherit all attributes from @p OrigLoopID.
+///        ""        : Do not inherit any attribute from @p OrigLoopID; only use
+///                    those specified by a followup attribute.
+///        "<prefix>": Inherit all attributes except those which start with
+///                    <prefix>; commonly used to remove metadata for the
+///                    applied transformation.
+/// @param AlwaysNew If true, do not try to reuse OrigLoopID and never return
+///                  None.
+///
+/// @return The loop ID for the after-transformation loop. The following values
+///         can be returned:
+///         None         : No followup attribute was found; it is up to the
+///                        transformation to choose attributes that make sense.
+///         @p OrigLoopID: The original identifier can be reused.
+///         nullptr      : The new loop has no attributes.
+///         MDNode*      : A new unique loop identifier.
+Optional<MDNode *>
+makeFollowupLoopID(MDNode *OrigLoopID, ArrayRef<StringRef> FollowupAttrs,
+                   const char *InheritOptionsAttrsPrefix = "",
+                   bool AlwaysNew = false);
+
+/// Look for the loop attribute that disables all transformation heuristic.
+bool hasDisableAllTransformsHint(const Loop *L);
+
+/// Look for the loop attribute that disables the LICM transformation heuristics.
+bool hasDisableLICMTransformsHint(const Loop *L);
+
+/// The mode sets how eager a transformation should be applied.
+enum TransformationMode {
+  /// The pass can use heuristics to determine whether a transformation should
+  /// be applied.
+  TM_Unspecified,
+
+  /// The transformation should be applied without considering a cost model.
+  TM_Enable,
+
+  /// The transformation should not be applied.
+  TM_Disable,
+
+  /// Force is a flag and should not be used alone.
+  TM_Force = 0x04,
+
+  /// The transformation was directed by the user, e.g. by a #pragma in
+  /// the source code. If the transformation could not be applied, a
+  /// warning should be emitted.
+  TM_ForcedByUser = TM_Enable | TM_Force,
+
+  /// The transformation must not be applied. For instance, `#pragma clang loop
+  /// unroll(disable)` explicitly forbids any unrolling to take place. Unlike
+  /// general loop metadata, it must not be dropped. Most passes should not
+  /// behave differently under TM_Disable and TM_SuppressedByUser.
+  TM_SuppressedByUser = TM_Disable | TM_Force
+};
+
+/// @{
+/// Get the mode for LLVM's supported loop transformations.
+TransformationMode hasUnrollTransformation(Loop *L);
+TransformationMode hasUnrollAndJamTransformation(Loop *L);
+TransformationMode hasVectorizeTransformation(Loop *L);
+TransformationMode hasDistributeTransformation(Loop *L);
+TransformationMode hasLICMVersioningTransformation(Loop *L);
+/// @}
+
 /// Set input string into loop metadata by keeping other values intact.
+/// If the string is already in loop metadata update value if it is
+/// different.
 void addStringMetadataToLoop(Loop *TheLoop, const char *MDString,
                              unsigned V = 0);
 
-/// Get a loop's estimated trip count based on branch weight metadata.
+/// Returns a loop's estimated trip count based on branch weight metadata.
+/// In addition if \p EstimatedLoopInvocationWeight is not null it is
+/// initialized with weight of loop's latch leading to the exit.
 /// Returns 0 when the count is estimated to be 0, or None when a meaningful
 /// estimate can not be made.
-Optional<unsigned> getLoopEstimatedTripCount(Loop *L);
+Optional<unsigned>
+getLoopEstimatedTripCount(Loop *L,
+                          unsigned *EstimatedLoopInvocationWeight = nullptr);
+
+/// Set a loop's branch weight metadata to reflect that loop has \p
+/// EstimatedTripCount iterations and \p EstimatedLoopInvocationWeight exits
+/// through latch. Returns true if metadata is successfully updated, false
+/// otherwise. Note that loop must have a latch block which controls loop exit
+/// in order to succeed.
+bool setLoopEstimatedTripCount(Loop *L, unsigned EstimatedTripCount,
+                               unsigned EstimatedLoopInvocationWeight);
 
 /// Check inner loop (L) backedge count is known to be invariant on all
 /// iterations of its outer loop. If the loop has no parent, this is trivially
@@ -203,7 +304,8 @@ void getLoopAnalysisUsage(AnalysisUsage &AU);
 /// If \p ORE is set use it to emit optimization remarks.
 bool canSinkOrHoistInst(Instruction &I, AAResults *AA, DominatorTree *DT,
                         Loop *CurLoop, AliasSetTracker *CurAST,
-                        bool TargetExecutesOncePerLoop,
+                        MemorySSAUpdater *MSSAU, bool TargetExecutesOncePerLoop,
+                        SinkAndHoistLICMFlags *LICMFlags = nullptr,
                         OptimizationRemarkEmitter *ORE = nullptr);
 
 /// Returns a Min/Max operation corresponding to MinMaxRecurrenceKind.
@@ -219,6 +321,7 @@ getOrderedReduction(IRBuilder<> &Builder, Value *Acc, Value *Src, unsigned Op,
                     ArrayRef<Value *> RedOps = None);
 
 /// Generates a vector reduction using shufflevectors to reduce the value.
+/// Fast-math-flags are propagated using the IRBuilder's setting.
 Value *getShuffleReduction(IRBuilder<> &Builder, Value *Src, unsigned Op,
                            RecurrenceDescriptor::MinMaxRecurrenceKind
                                MinMaxKind = RecurrenceDescriptor::MRK_Invalid,
@@ -229,6 +332,7 @@ Value *getShuffleReduction(IRBuilder<> &Builder, Value *Src, unsigned Op,
 /// additional information supplied in \p Flags.
 /// The target is queried to determine if intrinsics or shuffle sequences are
 /// required to implement the reduction.
+/// Fast-math-flags are propagated using the IRBuilder's setting.
 Value *createSimpleTargetReduction(IRBuilder<> &B,
                                    const TargetTransformInfo *TTI,
                                    unsigned Opcode, Value *Src,
@@ -239,6 +343,7 @@ Value *createSimpleTargetReduction(IRBuilder<> &B,
 /// Create a generic target reduction using a recurrence descriptor \p Desc
 /// The target is queried to determine if intrinsics or shuffle sequences are
 /// required to implement the reduction.
+/// Fast-math-flags are propagated using the RecurrenceDescriptor.
 Value *createTargetReduction(IRBuilder<> &B, const TargetTransformInfo *TTI,
                              RecurrenceDescriptor &Desc, Value *Src,
                              bool NoNaN = false);
@@ -250,6 +355,76 @@ Value *createTargetReduction(IRBuilder<> &B, const TargetTransformInfo *TTI,
 /// Flag set: NSW, NUW, exact, and all of fast-math.
 void propagateIRFlags(Value *I, ArrayRef<Value *> VL, Value *OpValue = nullptr);
 
+/// Returns true if we can prove that \p S is defined and always negative in
+/// loop \p L.
+bool isKnownNegativeInLoop(const SCEV *S, const Loop *L, ScalarEvolution &SE);
+
+/// Returns true if we can prove that \p S is defined and always non-negative in
+/// loop \p L.
+bool isKnownNonNegativeInLoop(const SCEV *S, const Loop *L,
+                              ScalarEvolution &SE);
+
+/// Returns true if \p S is defined and never is equal to signed/unsigned max.
+bool cannotBeMaxInLoop(const SCEV *S, const Loop *L, ScalarEvolution &SE,
+                       bool Signed);
+
+/// Returns true if \p S is defined and never is equal to signed/unsigned min.
+bool cannotBeMinInLoop(const SCEV *S, const Loop *L, ScalarEvolution &SE,
+                       bool Signed);
+
+enum ReplaceExitVal { NeverRepl, OnlyCheapRepl, NoHardUse, AlwaysRepl };
+
+/// If the final value of any expressions that are recurrent in the loop can
+/// be computed, substitute the exit values from the loop into any instructions
+/// outside of the loop that use the final values of the current expressions.
+/// Return the number of loop exit values that have been replaced, and the
+/// corresponding phi node will be added to DeadInsts.
+int rewriteLoopExitValues(Loop *L, LoopInfo *LI, TargetLibraryInfo *TLI,
+                          ScalarEvolution *SE, SCEVExpander &Rewriter,
+                          DominatorTree *DT, ReplaceExitVal ReplaceExitValue,
+                          SmallVector<WeakTrackingVH, 16> &DeadInsts);
+
+/// Set weights for \p UnrolledLoop and \p RemainderLoop based on weights for
+/// \p OrigLoop and the following distribution of \p OrigLoop iteration among \p
+/// UnrolledLoop and \p RemainderLoop. \p UnrolledLoop receives weights that
+/// reflect TC/UF iterations, and \p RemainderLoop receives weights that reflect
+/// the remaining TC%UF iterations.
+///
+/// Note that \p OrigLoop may be equal to either \p UnrolledLoop or \p
+/// RemainderLoop in which case weights for \p OrigLoop are updated accordingly.
+/// Note also behavior is undefined if \p UnrolledLoop and \p RemainderLoop are
+/// equal. \p UF must be greater than zero.
+/// If \p OrigLoop has no profile info associated nothing happens.
+///
+/// This utility may be useful for such optimizations as unroller and
+/// vectorizer as it's typical transformation for them.
+void setProfileInfoAfterUnrolling(Loop *OrigLoop, Loop *UnrolledLoop,
+                                  Loop *RemainderLoop, uint64_t UF);
+
+/// Utility that implements appending of loops onto a worklist given a range.
+/// We want to process loops in postorder, but the worklist is a LIFO data
+/// structure, so we append to it in *reverse* postorder.
+/// For trees, a preorder traversal is a viable reverse postorder, so we
+/// actually append using a preorder walk algorithm.
+template <typename RangeT>
+void appendLoopsToWorklist(RangeT &&, SmallPriorityWorklist<Loop *, 4> &);
+/// Utility that implements appending of loops onto a worklist given a range.
+/// It has the same behavior as appendLoopsToWorklist, but assumes the range of
+/// loops has already been reversed, so it processes loops in the given order.
+template <typename RangeT>
+void appendReversedLoopsToWorklist(RangeT &&,
+                                   SmallPriorityWorklist<Loop *, 4> &);
+
+/// Utility that implements appending of loops onto a worklist given LoopInfo.
+/// Calls the templated utility taking a Range of loops, handing it the Loops
+/// in LoopInfo, iterated in reverse. This is because the loops are stored in
+/// RPO w.r.t. the control flow graph in LoopInfo. For the purpose of unrolling,
+/// loop deletion, and LICM, we largely want to work forward across the CFG so
+/// that we visit defs before uses and can propagate simplifications from one
+/// loop nest into the next. Calls appendReversedLoopsToWorklist with the
+/// already reversed loops in LI.
+/// FIXME: Consider changing the order in LoopInfo.
+void appendLoopsToWorklist(LoopInfo &, SmallPriorityWorklist<Loop *, 4> &);
 } // end namespace llvm
 
 #endif // LLVM_TRANSFORMS_UTILS_LOOPUTILS_H

@@ -1,9 +1,8 @@
 //===- llvm/Analysis/VectorUtils.h - Vector utilities -----------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -15,16 +14,246 @@
 #define LLVM_ANALYSIS_VECTORUTILS_H
 
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Support/CheckedArithmetic.h"
 
 namespace llvm {
+
+/// Describes the type of Parameters
+enum class VFParamKind {
+  Vector,            // No semantic information.
+  OMP_Linear,        // declare simd linear(i)
+  OMP_LinearRef,     // declare simd linear(ref(i))
+  OMP_LinearVal,     // declare simd linear(val(i))
+  OMP_LinearUVal,    // declare simd linear(uval(i))
+  OMP_LinearPos,     // declare simd linear(i:c) uniform(c)
+  OMP_LinearValPos,  // declare simd linear(val(i:c)) uniform(c)
+  OMP_LinearRefPos,  // declare simd linear(ref(i:c)) uniform(c)
+  OMP_LinearUValPos, // declare simd linear(uval(i:c)) uniform(c
+  OMP_Uniform,       // declare simd uniform(i)
+  GlobalPredicate,   // Global logical predicate that acts on all lanes
+                     // of the input and output mask concurrently. For
+                     // example, it is implied by the `M` token in the
+                     // Vector Function ABI mangled name.
+  Unknown
+};
+
+/// Describes the type of Instruction Set Architecture
+enum class VFISAKind {
+  AdvancedSIMD, // AArch64 Advanced SIMD (NEON)
+  SVE,          // AArch64 Scalable Vector Extension
+  SSE,          // x86 SSE
+  AVX,          // x86 AVX
+  AVX2,         // x86 AVX2
+  AVX512,       // x86 AVX512
+  LLVM,         // LLVM internal ISA for functions that are not
+  // attached to an existing ABI via name mangling.
+  Unknown // Unknown ISA
+};
+
+/// Encapsulates information needed to describe a parameter.
+///
+/// The description of the parameter is not linked directly to
+/// OpenMP or any other vector function description. This structure
+/// is extendible to handle other paradigms that describe vector
+/// functions and their parameters.
+struct VFParameter {
+  unsigned ParamPos;         // Parameter Position in Scalar Function.
+  VFParamKind ParamKind;     // Kind of Parameter.
+  int LinearStepOrPos = 0;   // Step or Position of the Parameter.
+  Align Alignment = Align(); // Optional aligment in bytes, defaulted to 1.
+
+  // Comparison operator.
+  bool operator==(const VFParameter &Other) const {
+    return std::tie(ParamPos, ParamKind, LinearStepOrPos, Alignment) ==
+           std::tie(Other.ParamPos, Other.ParamKind, Other.LinearStepOrPos,
+                    Other.Alignment);
+  }
+};
+
+/// Contains the information about the kind of vectorization
+/// available.
+///
+/// This object in independent on the paradigm used to
+/// represent vector functions. in particular, it is not attached to
+/// any target-specific ABI.
+struct VFShape {
+  unsigned VF;     // Vectorization factor.
+  bool IsScalable; // True if the function is a scalable function.
+  SmallVector<VFParameter, 8> Parameters; // List of parameter informations.
+  // Comparison operator.
+  bool operator==(const VFShape &Other) const {
+    return std::tie(VF, IsScalable, Parameters) ==
+           std::tie(Other.VF, Other.IsScalable, Other.Parameters);
+  }
+
+  /// Update the parameter in position P.ParamPos to P.
+  void updateParam(VFParameter P) {
+    assert(P.ParamPos < Parameters.size() && "Invalid parameter position.");
+    Parameters[P.ParamPos] = P;
+    assert(hasValidParameterList() && "Invalid parameter list");
+  }
+
+  // Retrieve the basic vectorization shape of the function, where all
+  // parameters are mapped to VFParamKind::Vector with \p EC
+  // lanes. Specifies whether the function has a Global Predicate
+  // argument via \p HasGlobalPred.
+  static VFShape get(const CallInst &CI, ElementCount EC, bool HasGlobalPred) {
+    SmallVector<VFParameter, 8> Parameters;
+    for (unsigned I = 0; I < CI.arg_size(); ++I)
+      Parameters.push_back(VFParameter({I, VFParamKind::Vector}));
+    if (HasGlobalPred)
+      Parameters.push_back(
+          VFParameter({CI.arg_size(), VFParamKind::GlobalPredicate}));
+
+    return {EC.Min, EC.Scalable, Parameters};
+  }
+  /// Sanity check on the Parameters in the VFShape.
+  bool hasValidParameterList() const;
+};
+
+/// Holds the VFShape for a specific scalar to vector function mapping.
+struct VFInfo {
+  VFShape Shape;          /// Classification of the vector function.
+  std::string ScalarName; /// Scalar Function Name.
+  std::string VectorName; /// Vector Function Name associated to this VFInfo.
+  VFISAKind ISA;          /// Instruction Set Architecture.
+
+  // Comparison operator.
+  bool operator==(const VFInfo &Other) const {
+    return std::tie(Shape, ScalarName, VectorName, ISA) ==
+           std::tie(Shape, Other.ScalarName, Other.VectorName, Other.ISA);
+  }
+};
+
+namespace VFABI {
+/// LLVM Internal VFABI ISA token for vector functions.
+static constexpr char const *_LLVM_ = "_LLVM_";
+/// Prefix for internal name redirection for vector function that
+/// tells the compiler to scalarize the call using the scalar name
+/// of the function. For example, a mangled name like
+/// `_ZGV_LLVM_N2v_foo(_LLVM_Scalarize_foo)` would tell the
+/// vectorizer to vectorize the scalar call `foo`, and to scalarize
+/// it once vectorization is done.
+static constexpr char const *_LLVM_Scalarize_ = "_LLVM_Scalarize_";
+
+/// Function to contruct a VFInfo out of a mangled names in the
+/// following format:
+///
+/// <VFABI_name>{(<redirection>)}
+///
+/// where <VFABI_name> is the name of the vector function, mangled according
+/// to the rules described in the Vector Function ABI of the target vector
+/// extentsion (or <isa> from now on). The <VFABI_name> is in the following
+/// format:
+///
+/// _ZGV<isa><mask><vlen><parameters>_<scalarname>[(<redirection>)]
+///
+/// This methods support demangling rules for the following <isa>:
+///
+/// * AArch64: https://developer.arm.com/docs/101129/latest
+///
+/// * x86 (libmvec): https://sourceware.org/glibc/wiki/libmvec and
+///  https://sourceware.org/glibc/wiki/libmvec?action=AttachFile&do=view&target=VectorABI.txt
+///
+/// \param MangledName -> input string in the format
+/// _ZGV<isa><mask><vlen><parameters>_<scalarname>[(<redirection>)].
+/// \param M -> Module used to retrive informations about the vector
+/// function that are not possible to retrieve from the mangled
+/// name. At the moment, this parameter is needed only to retrive the
+/// Vectorization Factor of scalable vector functions from their
+/// respective IR declarations.
+Optional<VFInfo> tryDemangleForVFABI(StringRef MangledName, const Module &M);
+
+/// Retrieve the `VFParamKind` from a string token.
+VFParamKind getVFParamKindFromString(const StringRef Token);
+
+// Name of the attribute where the variant mappings are stored.
+static constexpr char const *MappingsAttrName = "vector-function-abi-variant";
+
+/// Populates a set of strings representing the Vector Function ABI variants
+/// associated to the CallInst CI.
+void getVectorVariantNames(const CallInst &CI,
+                           SmallVectorImpl<std::string> &VariantMappings);
+} // end namespace VFABI
+
+/// The Vector Function Database.
+///
+/// Helper class used to find the vector functions associated to a
+/// scalar CallInst.
+class VFDatabase {
+  /// The Module of the CallInst CI.
+  const Module *M;
+  /// List of vector functions descritors associated to the call
+  /// instruction.
+  const SmallVector<VFInfo, 8> ScalarToVectorMappings;
+
+  /// Retreive the scalar-to-vector mappings associated to the rule of
+  /// a vector Function ABI.
+  static void getVFABIMappings(const CallInst &CI,
+                               SmallVectorImpl<VFInfo> &Mappings) {
+    const StringRef ScalarName = CI.getCalledFunction()->getName();
+    const StringRef S =
+        CI.getAttribute(AttributeList::FunctionIndex, VFABI::MappingsAttrName)
+            .getValueAsString();
+    if (S.empty())
+      return;
+
+    SmallVector<std::string, 8> ListOfStrings;
+    VFABI::getVectorVariantNames(CI, ListOfStrings);
+    for (const auto &MangledName : ListOfStrings) {
+      const Optional<VFInfo> Shape =
+          VFABI::tryDemangleForVFABI(MangledName, *(CI.getModule()));
+      // A match is found via scalar and vector names, and also by
+      // ensuring that the variant described in the attribute has a
+      // corresponding definition or declaration of the vector
+      // function in the Module M.
+      if (Shape.hasValue() && (Shape.getValue().ScalarName == ScalarName)) {
+        assert(CI.getModule()->getFunction(Shape.getValue().VectorName) &&
+               "Vector function is missing.");
+        Mappings.push_back(Shape.getValue());
+      }
+    }
+  }
+
+public:
+  /// Retrieve all the VFInfo instances associated to the CallInst CI.
+  static SmallVector<VFInfo, 8> getMappings(const CallInst &CI) {
+    SmallVector<VFInfo, 8> Ret;
+
+    // Get mappings from the Vector Function ABI variants.
+    getVFABIMappings(CI, Ret);
+
+    // Other non-VFABI variants should be retrieved here.
+
+    return Ret;
+  }
+
+  /// Constructor, requires a CallInst instance.
+  VFDatabase(CallInst &CI)
+      : M(CI.getModule()), ScalarToVectorMappings(VFDatabase::getMappings(CI)) {
+  }
+  /// \defgroup VFDatabase query interface.
+  ///
+  /// @{
+  /// Retrieve the Function with VFShape \p Shape.
+  Function *getVectorizedFunction(const VFShape &Shape) const {
+    for (const auto &Info : ScalarToVectorMappings)
+      if (Info.Shape == Shape)
+        return M->getFunction(Info.VectorName);
+
+    return nullptr;
+  }
+  /// @}
+};
 
 template <typename T> class ArrayRef;
 class DemandedBits;
 class GetElementPtrInst;
-class InterleaveGroup; 
+template <typename InstTy> class InterleaveGroup;
 class Loop;
 class ScalarEvolution;
 class TargetTransformInfo;
@@ -32,17 +261,16 @@ class Type;
 class Value;
 
 namespace Intrinsic {
-enum ID : unsigned;
+typedef unsigned ID;
 }
 
 /// Identify if the intrinsic is trivially vectorizable.
-/// This method returns true if the intrinsic's argument types are all
-/// scalars for the scalar form of the intrinsic and all vectors for
-/// the vector form of the intrinsic.
+/// This method returns true if the intrinsic's argument types are all scalars
+/// for the scalar form of the intrinsic and all vectors (or scalars handled by
+/// hasVectorInstrinsicScalarOpd) for the vector form of the intrinsic.
 bool isTriviallyVectorizable(Intrinsic::ID ID);
 
-/// Identifies if the intrinsic has a scalar operand. It checks for
-/// ctlz,cttz and powi special intrinsics whose argument is scalar.
+/// Identifies if the vector form of the intrinsic has a scalar operand.
 bool hasVectorInstrinsicScalarOpd(Intrinsic::ID ID, unsigned ScalarOpdIdx);
 
 /// Returns intrinsic ID for call.
@@ -73,10 +301,23 @@ Value *getStrideFromPointer(Value *Ptr, ScalarEvolution *SE, Loop *Lp);
 /// from the vector.
 Value *findScalarElement(Value *V, unsigned EltNo);
 
+/// If all non-negative \p Mask elements are the same value, return that value.
+/// If all elements are negative (undefined) or \p Mask contains different
+/// non-negative values, return -1.
+int getSplatIndex(ArrayRef<int> Mask);
+
 /// Get splat value if the input is a splat vector or return nullptr.
 /// The value may be extracted from a splat constants vector or from
 /// a sequence of instructions that broadcast a single value into a vector.
 const Value *getSplatValue(const Value *V);
+
+/// Return true if each element of the vector value \p V is poisoned or equal to
+/// every other non-poisoned element. If an index element is specified, either
+/// every element of the vector is poisoned or the element at that index is not
+/// poisoned and equal to every other non-poisoned element.
+/// This may be more powerful than the related getSplatValue() because it is
+/// not limited by finding a scalar source value to a splatted vector.
+bool isSplatValue(const Value *V, int Index = -1, unsigned Depth = 0);
 
 /// Compute a map of integer instructions to their minimum legal type
 /// size.
@@ -117,8 +358,24 @@ computeMinimumValueSizes(ArrayRef<BasicBlock*> Blocks,
                          DemandedBits &DB,
                          const TargetTransformInfo *TTI=nullptr);
 
+/// Compute the union of two access-group lists.
+///
+/// If the list contains just one access group, it is returned directly. If the
+/// list is empty, returns nullptr.
+MDNode *uniteAccessGroups(MDNode *AccGroups1, MDNode *AccGroups2);
+
+/// Compute the access-group list of access groups that @p Inst1 and @p Inst2
+/// are both in. If either instruction does not access memory at all, it is
+/// considered to be in every list.
+///
+/// If the list contains just one access group, it is returned directly. If the
+/// list is empty, returns nullptr.
+MDNode *intersectAccessGroups(const Instruction *Inst1,
+                              const Instruction *Inst2);
+
 /// Specifically, let Kinds = [MD_tbaa, MD_alias_scope, MD_noalias, MD_fpmath,
-/// MD_nontemporal].  For K in Kinds, we get the MDNode for K from each of the
+/// MD_nontemporal, MD_access_group].
+/// For K in Kinds, we get the MDNode for K from each of the
 /// elements of VL, compute their "intersection" (i.e., the most generic
 /// metadata value that covers all of the individual values), and set I's
 /// metadata for M equal to the intersection value.
@@ -138,11 +395,11 @@ Instruction *propagateMetadata(Instruction *I, ArrayRef<Value *> VL);
 /// create[*]Mask() utilities which create a shuffle mask (mask that
 /// consists of indices).
 Constant *createBitMaskForGaps(IRBuilder<> &Builder, unsigned VF,
-                               const InterleaveGroup &Group);
+                               const InterleaveGroup<Instruction> &Group);
 
 /// Create a mask with replicated elements.
 ///
-/// This function creates a shuffle mask for replicating each of the \p VF 
+/// This function creates a shuffle mask for replicating each of the \p VF
 /// elements in a vector \p ReplicationFactor times. It can be used to
 /// transform a mask of \p VF elements into a mask of
 /// \p VF * \p ReplicationFactor elements used by a predicated
@@ -207,6 +464,20 @@ Constant *createSequentialMask(IRBuilder<> &Builder, unsigned Start,
 /// elements, it will be padded with undefs.
 Value *concatenateVectors(IRBuilder<> &Builder, ArrayRef<Value *> Vecs);
 
+/// Given a mask vector of the form <Y x i1>, Return true if all of the
+/// elements of this predicate mask are false or undef.  That is, return true
+/// if all lanes can be assumed inactive. 
+bool maskIsAllZeroOrUndef(Value *Mask);
+
+/// Given a mask vector of the form <Y x i1>, Return true if all of the
+/// elements of this predicate mask are true or undef.  That is, return true
+/// if all lanes can be assumed active. 
+bool maskIsAllOneOrUndef(Value *Mask);
+
+/// Given a mask vector of the form <Y x i1>, return an APInt (of bitwidth Y)
+/// for each lane which may be active.
+APInt possiblyDemandedEltsInMask(Value *Mask);
+  
 /// The group of interleaved loads/stores sharing the same stride and
 /// close to each other.
 ///
@@ -233,12 +504,14 @@ Value *concatenateVectors(IRBuilder<> &Builder, ArrayRef<Value *> Vecs);
 ///
 /// Note: the interleaved load group could have gaps (missing members), but
 /// the interleaved store group doesn't allow gaps.
-class InterleaveGroup {
+template <typename InstTy> class InterleaveGroup {
 public:
-  InterleaveGroup(Instruction *Instr, int Stride, unsigned Align)
-      : Align(Align), InsertPos(Instr) {
-    assert(Align && "The alignment should be non-zero");
+  InterleaveGroup(uint32_t Factor, bool Reverse, Align Alignment)
+      : Factor(Factor), Reverse(Reverse), Alignment(Alignment),
+        InsertPos(nullptr) {}
 
+  InterleaveGroup(InstTy *Instr, int32_t Stride, Align Alignment)
+      : Alignment(Alignment), InsertPos(Instr) {
     Factor = std::abs(Stride);
     assert(Factor > 1 && "Invalid interleave factor");
 
@@ -247,19 +520,22 @@ public:
   }
 
   bool isReverse() const { return Reverse; }
-  unsigned getFactor() const { return Factor; }
-  unsigned getAlignment() const { return Align; }
-  unsigned getNumMembers() const { return Members.size(); }
+  uint32_t getFactor() const { return Factor; }
+  uint32_t getAlignment() const { return Alignment.value(); }
+  Align getAlign() const { return Alignment; }
+  uint32_t getNumMembers() const { return Members.size(); }
 
   /// Try to insert a new member \p Instr with index \p Index and
   /// alignment \p NewAlign. The index is related to the leader and it could be
   /// negative if it is the new leader.
   ///
   /// \returns false if the instruction doesn't belong to the group.
-  bool insertMember(Instruction *Instr, int Index, unsigned NewAlign) {
-    assert(NewAlign && "The new member's alignment should be non-zero");
-
-    int Key = Index + SmallestKey;
+  bool insertMember(InstTy *Instr, int32_t Index, Align NewAlign) {
+    // Make sure the key fits in an int32_t.
+    Optional<int32_t> MaybeKey = checkedAdd(Index, SmallestKey);
+    if (!MaybeKey)
+      return false;
+    int32_t Key = *MaybeKey;
 
     // Skip if there is already a member with the same index.
     if (Members.find(Key) != Members.end())
@@ -267,20 +543,26 @@ public:
 
     if (Key > LargestKey) {
       // The largest index is always less than the interleave factor.
-      if (Index >= static_cast<int>(Factor))
+      if (Index >= static_cast<int32_t>(Factor))
         return false;
 
       LargestKey = Key;
     } else if (Key < SmallestKey) {
+
+      // Make sure the largest index fits in an int32_t.
+      Optional<int32_t> MaybeLargestIndex = checkedSub(LargestKey, Key);
+      if (!MaybeLargestIndex)
+        return false;
+
       // The largest index is always less than the interleave factor.
-      if (LargestKey - Key >= static_cast<int>(Factor))
+      if (*MaybeLargestIndex >= static_cast<int64_t>(Factor))
         return false;
 
       SmallestKey = Key;
     }
 
     // It's always safe to select the minimum alignment.
-    Align = std::min(Align, NewAlign);
+    Alignment = std::min(Alignment, NewAlign);
     Members[Key] = Instr;
     return true;
   }
@@ -288,8 +570,8 @@ public:
   /// Get the member with the given index \p Index
   ///
   /// \returns nullptr if contains no such member.
-  Instruction *getMember(unsigned Index) const {
-    int Key = SmallestKey + Index;
+  InstTy *getMember(uint32_t Index) const {
+    int32_t Key = SmallestKey + Index;
     auto Member = Members.find(Key);
     if (Member == Members.end())
       return nullptr;
@@ -299,16 +581,17 @@ public:
 
   /// Get the index for the given member. Unlike the key in the member
   /// map, the index starts from 0.
-  unsigned getIndex(Instruction *Instr) const {
-    for (auto I : Members)
+  uint32_t getIndex(const InstTy *Instr) const {
+    for (auto I : Members) {
       if (I.second == Instr)
         return I.first - SmallestKey;
+    }
 
     llvm_unreachable("InterleaveGroup contains no such member");
   }
 
-  Instruction *getInsertPos() const { return InsertPos; }
-  void setInsertPos(Instruction *Inst) { InsertPos = Inst; }
+  InstTy *getInsertPos() const { return InsertPos; }
+  void setInsertPos(InstTy *Inst) { InsertPos = Inst; }
 
   /// Add metadata (e.g. alias info) from the instructions in this group to \p
   /// NewInst.
@@ -316,12 +599,7 @@ public:
   /// FIXME: this function currently does not add noalias metadata a'la
   /// addNewMedata.  To do that we need to compute the intersection of the
   /// noalias info from all members.
-  void addMetadata(Instruction *NewInst) const {
-    SmallVector<Value *, 4> VL;
-    std::transform(Members.begin(), Members.end(), std::back_inserter(VL),
-                   [](std::pair<int, Instruction *> p) { return p.second; });
-    propagateMetadata(NewInst, VL);
-  }
+  void addMetadata(InstTy *NewInst) const;
 
   /// Returns true if this Group requires a scalar iteration to handle gaps.
   bool requiresScalarEpilogue() const {
@@ -341,12 +619,12 @@ public:
   }
 
 private:
-  unsigned Factor; // Interleave Factor.
+  uint32_t Factor; // Interleave Factor.
   bool Reverse;
-  unsigned Align;
-  DenseMap<int, Instruction *> Members;
-  int SmallestKey = 0;
-  int LargestKey = 0;
+  Align Alignment;
+  DenseMap<int32_t, InstTy *> Members;
+  int32_t SmallestKey = 0;
+  int32_t LargestKey = 0;
 
   // To avoid breaking dependences, vectorized instructions of an interleave
   // group should be inserted at either the first load or the last store in
@@ -359,7 +637,7 @@ private:
   //      store i32 %even
   //      %odd = add i32               // Def of %odd
   //      store i32 %odd               // Insert Position
-  Instruction *InsertPos;
+  InstTy *InsertPos;
 };
 
 /// Drive the analysis of interleaved memory accesses in the loop.
@@ -390,13 +668,10 @@ public:
   /// formation for predicated accesses, we may be able to relax this limitation
   /// in the future once we handle more complicated blocks.
   void reset() {
-    SmallPtrSet<InterleaveGroup *, 4> DelSet;
-    // Avoid releasing a pointer twice.
-    for (auto &I : InterleaveGroupMap)
-      DelSet.insert(I.second);
-    for (auto *Ptr : DelSet)
-      delete Ptr;
     InterleaveGroupMap.clear();
+    for (auto *Ptr : InterleaveGroups)
+      delete Ptr;
+    InterleaveGroups.clear();
     RequiresScalarEpilogue = false;
   }
 
@@ -409,11 +684,16 @@ public:
   /// Get the interleave group that \p Instr belongs to.
   ///
   /// \returns nullptr if doesn't have such group.
-  InterleaveGroup *getInterleaveGroup(Instruction *Instr) const {
-    auto Group = InterleaveGroupMap.find(Instr);
-    if (Group == InterleaveGroupMap.end())
-      return nullptr;
-    return Group->second;
+  InterleaveGroup<Instruction> *
+  getInterleaveGroup(const Instruction *Instr) const {
+    if (InterleaveGroupMap.count(Instr))
+      return InterleaveGroupMap.find(Instr)->second;
+    return nullptr;
+  }
+
+  iterator_range<SmallPtrSetIterator<llvm::InterleaveGroup<Instruction> *>>
+  getInterleaveGroups() {
+    return make_range(InterleaveGroups.begin(), InterleaveGroups.end());
   }
 
   /// Returns true if an interleaved group that may access memory
@@ -443,7 +723,9 @@ private:
   bool RequiresScalarEpilogue = false;
 
   /// Holds the relationships between the members and the interleave group.
-  DenseMap<Instruction *, InterleaveGroup *> InterleaveGroupMap;
+  DenseMap<Instruction *, InterleaveGroup<Instruction> *> InterleaveGroupMap;
+
+  SmallPtrSet<InterleaveGroup<Instruction> *, 4> InterleaveGroups;
 
   /// Holds dependences among the memory accesses in the loop. It maps a source
   /// access to a set of dependent sink accesses.
@@ -453,8 +735,8 @@ private:
   struct StrideDescriptor {
     StrideDescriptor() = default;
     StrideDescriptor(int64_t Stride, const SCEV *Scev, uint64_t Size,
-                     unsigned Align)
-        : Stride(Stride), Scev(Scev), Size(Size), Align(Align) {}
+                     Align Alignment)
+        : Stride(Stride), Scev(Scev), Size(Size), Alignment(Alignment) {}
 
     // The access's stride. It is negative for a reverse access.
     int64_t Stride = 0;
@@ -466,7 +748,7 @@ private:
     uint64_t Size = 0;
 
     // The alignment of this access.
-    unsigned Align = 0;
+    Align Alignment;
   };
 
   /// A type for holding instructions and their stride descriptors.
@@ -476,19 +758,23 @@ private:
   /// stride \p Stride and alignment \p Align.
   ///
   /// \returns the newly created interleave group.
-  InterleaveGroup *createInterleaveGroup(Instruction *Instr, int Stride,
-                                         unsigned Align) {
-    assert(!isInterleaved(Instr) && "Already in an interleaved access group");
-    InterleaveGroupMap[Instr] = new InterleaveGroup(Instr, Stride, Align);
+  InterleaveGroup<Instruction> *
+  createInterleaveGroup(Instruction *Instr, int Stride, Align Alignment) {
+    assert(!InterleaveGroupMap.count(Instr) &&
+           "Already in an interleaved access group");
+    InterleaveGroupMap[Instr] =
+        new InterleaveGroup<Instruction>(Instr, Stride, Alignment);
+    InterleaveGroups.insert(InterleaveGroupMap[Instr]);
     return InterleaveGroupMap[Instr];
   }
 
   /// Release the group and remove all the relationships.
-  void releaseGroup(InterleaveGroup *Group) {
+  void releaseGroup(InterleaveGroup<Instruction> *Group) {
     for (unsigned i = 0; i < Group->getFactor(); i++)
       if (Instruction *Member = Group->getMember(i))
         InterleaveGroupMap.erase(Member);
 
+    InterleaveGroups.erase(Group);
     delete Group;
   }
 

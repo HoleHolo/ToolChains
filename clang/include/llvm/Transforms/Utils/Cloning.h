@@ -1,9 +1,8 @@
 //===- Cloning.h - Clone various parts of LLVM programs ---------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -47,6 +46,7 @@ class LoopInfo;
 class Module;
 class ProfileSummaryInfo;
 class ReturnInst;
+class DomTreeUpdater;
 
 /// Return an exact copy of the specified module
 std::unique_ptr<Module> CloneModule(const Module &M);
@@ -229,10 +229,7 @@ public:
 /// and all varargs at the callsite will be passed to any calls to
 /// ForwardVarArgsTo. The caller of InlineFunction has to make sure any varargs
 /// are only used by ForwardVarArgsTo.
-InlineResult InlineFunction(CallInst *C, InlineFunctionInfo &IFI,
-                            AAResults *CalleeAAR = nullptr,
-                            bool InsertLifetime = true);
-InlineResult InlineFunction(InvokeInst *II, InlineFunctionInfo &IFI,
+InlineResult InlineFunction(CallBase *CB, InlineFunctionInfo &IFI,
                             AAResults *CalleeAAR = nullptr,
                             bool InsertLifetime = true);
 InlineResult InlineFunction(CallSite CS, InlineFunctionInfo &IFI,
@@ -262,11 +259,19 @@ void remapInstructionsInBlocks(const SmallVectorImpl<BasicBlock *> &Blocks,
 /// we replace them with the uses of corresponding Phi inputs. ValueMapping
 /// is used to map the original instructions from BB to their newly-created
 /// copies. Returns the split block.
-BasicBlock *
-DuplicateInstructionsInSplitBetween(BasicBlock *BB, BasicBlock *PredBB,
-                                    Instruction *StopAt,
-                                    ValueToValueMapTy &ValueMapping,
-                                    DominatorTree *DT = nullptr);
+BasicBlock *DuplicateInstructionsInSplitBetween(BasicBlock *BB,
+                                                BasicBlock *PredBB,
+                                                Instruction *StopAt,
+                                                ValueToValueMapTy &ValueMapping,
+                                                DomTreeUpdater &DTU);
+
+/// Updates profile information by adjusting the entry count by adding
+/// entryDelta then scaling callsite information by the new count divided by the
+/// old count. VMap is used during inlinng to also update the new clone
+void updateProfileCallee(
+    Function *Callee, int64_t entryDelta,
+    const ValueMap<const Value *, WeakTrackingVH> *VMap = nullptr);
+
 } // end namespace llvm
 
 #endif // LLVM_TRANSFORMS_UTILS_CLONING_H

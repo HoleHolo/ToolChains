@@ -1,9 +1,8 @@
 //===- IdentifierTable.h - Hash table for identifier lookup -----*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -116,10 +115,19 @@ class alignas(IdentifierInfoAlignment) IdentifierInfo {
 
   llvm::StringMapEntry<IdentifierInfo *> *Entry = nullptr;
 
+  IdentifierInfo()
+      : TokenID(tok::identifier), ObjCOrBuiltinID(0), HasMacro(false),
+        HadMacro(false), IsExtension(false), IsFutureCompatKeyword(false),
+        IsPoisoned(false), IsCPPOperatorKeyword(false),
+        NeedsHandleIdentifier(false), IsFromAST(false), ChangedAfterLoad(false),
+        FEChangedAfterLoad(false), RevertedTokenID(false), OutOfDate(false),
+        IsModulesImport(false) {}
+
 public:
-  IdentifierInfo();
   IdentifierInfo(const IdentifierInfo &) = delete;
   IdentifierInfo &operator=(const IdentifierInfo &) = delete;
+  IdentifierInfo(IdentifierInfo &&) = delete;
+  IdentifierInfo &operator=(IdentifierInfo &&) = delete;
 
   /// Return true if this is the identifier for the specified string.
   ///
@@ -138,31 +146,10 @@ public:
 
   /// Return the beginning of the actual null-terminated string for this
   /// identifier.
-  const char *getNameStart() const {
-    if (Entry) return Entry->getKeyData();
-    // FIXME: This is gross. It would be best not to embed specific details
-    // of the PTH file format here.
-    // The 'this' pointer really points to a
-    // std::pair<IdentifierInfo, const char*>, where internal pointer
-    // points to the external string data.
-    using actualtype = std::pair<IdentifierInfo, const char *>;
-
-    return ((const actualtype*) this)->second;
-  }
+  const char *getNameStart() const { return Entry->getKeyData(); }
 
   /// Efficiently return the length of this identifier info.
-  unsigned getLength() const {
-    if (Entry) return Entry->getKeyLength();
-    // FIXME: This is gross. It would be best not to embed specific details
-    // of the PTH file format here.
-    // The 'this' pointer really points to a
-    // std::pair<IdentifierInfo, const char*>, where internal pointer
-    // points to the external string data.
-    using actualtype = std::pair<IdentifierInfo, const char *>;
-
-    const char* p = ((const actualtype*) this)->second - 2;
-    return (((unsigned) p[0]) | (((unsigned) p[1]) << 8)) - 1;
-  }
+  unsigned getLength() const { return Entry->getKeyLength(); }
 
   /// Return the actual identifier string.
   StringRef getName() const {
@@ -397,6 +384,17 @@ public:
     return getName().startswith("<#") && getName().endswith("#>");
   }
 
+  /// Determine whether \p this is a name reserved for the implementation (C99
+  /// 7.1.3, C++ [lib.global.names]).
+  bool isReservedName(bool doubleUnderscoreOnly = false) const {
+    if (getLength() < 2)
+      return false;
+    const char *Name = getNameStart();
+    return Name[0] == '_' &&
+           (Name[1] == '_' ||
+            (Name[1] >= 'A' && Name[1] <= 'Z' && !doubleUnderscoreOnly));
+  }
+
   /// Provide less than operator for lexicographical sorting.
   bool operator<(const IdentifierInfo &RHS) const {
     return getName() < RHS.getName();
@@ -594,6 +592,8 @@ public:
   iterator end() const   { return HashTable.end(); }
   unsigned size() const  { return HashTable.size(); }
 
+  iterator find(StringRef Name) const { return HashTable.find(Name); }
+
   /// Print some statistics to stderr that indicate how well the
   /// hashing is doing.
   void PrintStats() const;
@@ -762,6 +762,12 @@ public:
   bool isUnarySelector() const {
     return getIdentifierInfoFlag() == ZeroArg;
   }
+
+  /// If this selector is the specific keyword selector described by Names.
+  bool isKeywordSelector(ArrayRef<StringRef> Names) const;
+
+  /// If this selector is the specific unary selector described by Name.
+  bool isUnarySelector(StringRef Name) const;
 
   unsigned getNumArgs() const;
 
@@ -951,9 +957,6 @@ struct DenseMapInfo<clang::Selector> {
   }
 };
 
-template <>
-struct isPodLike<clang::Selector> { static const bool value = true; };
-
 template<>
 struct PointerLikeTypeTraits<clang::Selector> {
   static const void *getAsVoidPointer(clang::Selector P) {
@@ -964,7 +967,7 @@ struct PointerLikeTypeTraits<clang::Selector> {
     return clang::Selector(reinterpret_cast<uintptr_t>(P));
   }
 
-  enum { NumLowBitsAvailable = 0 };
+  static constexpr int NumLowBitsAvailable = 0;
 };
 
 // Provide PointerLikeTypeTraits for IdentifierInfo pointers, which
@@ -979,7 +982,7 @@ struct PointerLikeTypeTraits<clang::IdentifierInfo*> {
     return static_cast<clang::IdentifierInfo*>(P);
   }
 
-  enum { NumLowBitsAvailable = 1 };
+  static constexpr int NumLowBitsAvailable = 1;
 };
 
 template<>
@@ -992,7 +995,7 @@ struct PointerLikeTypeTraits<const clang::IdentifierInfo*> {
     return static_cast<const clang::IdentifierInfo*>(P);
   }
 
-  enum { NumLowBitsAvailable = 1 };
+  static constexpr int NumLowBitsAvailable = 1;
 };
 
 } // namespace llvm

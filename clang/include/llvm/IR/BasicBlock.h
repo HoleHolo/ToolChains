@@ -1,9 +1,8 @@
 //===- llvm/BasicBlock.h - Represent a basic block in the VM ----*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -134,6 +133,15 @@ public:
          static_cast<const BasicBlock *>(this)->getTerminatingDeoptimizeCall());
   }
 
+  /// Returns the call instruction calling \@llvm.experimental.deoptimize
+  /// that is present either in current basic block or in block that is a unique
+  /// successor to current block, if such call is present. Otherwise, returns null.
+  const CallInst *getPostdominatingDeoptimizeCall() const;
+  CallInst *getPostdominatingDeoptimizeCall() {
+    return const_cast<CallInst *>(
+         static_cast<const BasicBlock *>(this)->getPostdominatingDeoptimizeCall());
+  }
+
   /// Returns the call instruction marked 'musttail' prior to the terminating
   /// return instruction of this basic block, if such a call is present.
   /// Otherwise, returns null.
@@ -193,6 +201,11 @@ public:
                                  std::function<bool(Instruction &)>>>
   instructionsWithoutDebug();
 
+  /// Return the size of the basic block ignoring debug instructions
+  filter_iterator<BasicBlock::const_iterator,
+                  std::function<bool(const Instruction &)>>::difference_type
+  sizeWithoutDebug() const;
+
   /// Unlink 'this' from the containing function, but do not delete it.
   void removeFromParent();
 
@@ -236,6 +249,12 @@ public:
     return const_cast<BasicBlock *>(
                  static_cast<const BasicBlock *>(this)->getUniquePredecessor());
   }
+
+  /// Return true if this block has exactly N predecessors.
+  bool hasNPredecessors(unsigned N) const;
+
+  /// Return true if this block has N predecessors or more.
+  bool hasNPredecessorsOrMore(unsigned N) const;
 
   /// Return the successor of this block if it has a single successor.
   /// Otherwise return a null pointer.
@@ -357,7 +376,7 @@ public:
   /// This is actually not used to update the Predecessor list, but is actually
   /// used to update the PHI nodes that reside in the block.  Note that this
   /// should be called while the predecessor still refers to this block.
-  void removePredecessor(BasicBlock *Pred, bool DontDeleteUselessPHIs = false);
+  void removePredecessor(BasicBlock *Pred, bool KeepOneInputPHIs = false);
 
   bool canSplitPredecessors() const;
 
@@ -384,6 +403,14 @@ public:
   /// Returns true if there are any uses of this basic block other than
   /// direct branches, switches, etc. to it.
   bool hasAddressTaken() const { return getSubclassDataFromValue() != 0; }
+
+  /// Update all phi nodes in this basic block to refer to basic block \p New
+  /// instead of basic block \p Old.
+  void replacePhiUsesWith(BasicBlock *Old, BasicBlock *New);
+
+  /// Update all phi nodes in this basic block's successors to refer to basic
+  /// block \p New instead of basic block \p Old.
+  void replaceSuccessorsPhiUsesWith(BasicBlock *Old, BasicBlock *New);
 
   /// Update all phi nodes in this basic block's successors to refer to basic
   /// block \p New instead of to it.

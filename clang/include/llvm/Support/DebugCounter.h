@@ -1,9 +1,8 @@
 //===- llvm/Support/DebugCounter.h - Debug counter support ------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 /// \file
@@ -69,7 +68,7 @@ public:
   // line option parsing. The main reason to register counters is to produce a
   // nice list of them on the command line, but i'm not sure this is worth it.
   static unsigned registerCounter(StringRef Name, StringRef Desc) {
-    return instance().addCounter(Name, Desc);
+    return instance().addCounter(std::string(Name), std::string(Desc));
   }
   inline static bool shouldExecute(unsigned CounterName) {
     if (!isCountingEnabled())

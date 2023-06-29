@@ -1,9 +1,8 @@
 //===- AnalyzerOptions.h - Analysis Engine Options --------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -20,6 +19,7 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
 #include <string>
 #include <utility>
 #include <vector>
@@ -163,13 +163,46 @@ class AnalyzerOptions : public RefCountedBase<AnalyzerOptions> {
 public:
   using ConfigTable = llvm::StringMap<std::string>;
 
+  /// Retrieves the list of checkers generated from Checkers.td. This doesn't
+  /// contain statically linked but non-generated checkers and plugin checkers!
   static std::vector<StringRef>
   getRegisteredCheckers(bool IncludeExperimental = false);
 
-  /// Pair of checker name and enable/disable.
-  std::vector<std::pair<std::string, bool>> CheckersControlList;
+  /// Retrieves the list of packages generated from Checkers.td. This doesn't
+  /// contain statically linked but non-generated packages and plugin packages!
+  static std::vector<StringRef>
+  getRegisteredPackages(bool IncludeExperimental = false);
+
+  /// Convenience function for printing options or checkers and their
+  /// description in a formatted manner. If \p MinLineWidth is set to 0, no line
+  /// breaks are introduced for the description.
+  ///
+  /// Format, depending whether the option name's length is less then
+  /// \p OptionWidth:
+  ///
+  ///   <padding>EntryName<padding>Description
+  ///   <---------padding--------->Description
+  ///   <---------padding--------->Description
+  ///
+  ///   <padding>VeryVeryLongOptionName
+  ///   <---------padding--------->Description
+  ///   <---------padding--------->Description
+  ///   ^~~~~~~~ InitialPad
+  ///   ^~~~~~~~~~~~~~~~~~~~~~~~~~ EntryWidth
+  ///   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~MinLineWidth
+  static void printFormattedEntry(
+      llvm::raw_ostream &Out,
+      std::pair<StringRef, StringRef> EntryDescPair,
+      size_t EntryWidth, size_t InitialPad, size_t MinLineWidth = 0);
+
+  /// Pairs of checker/package name and enable/disable.
+  std::vector<std::pair<std::string, bool>> CheckersAndPackages;
+
+  /// Vector of checker/package names which will not emit warnings.
+  std::vector<std::string> SilencedCheckersAndPackages;
 
   /// A key-value table of use-specified configuration values.
+  // TODO: This shouldn't be public.
   ConfigTable Config;
   AnalysisStores AnalysisStoreOpt = RegionStoreModel;
   AnalysisConstraints AnalysisConstraintsOpt = RangeConstraintsModel;
@@ -188,16 +221,24 @@ public:
   /// The maximum number of times the analyzer visits a block.
   unsigned maxBlockVisitOnPath;
 
-  /// Disable all analyzer checks.
+  /// Disable all analyzer checkers.
   ///
-  /// This flag allows one to disable analyzer checks on the code processed by
+  /// This flag allows one to disable analyzer checkers on the code processed by
   /// the given analysis consumer. Note, the code will get parsed and the
   /// command-line options will get checked.
-  unsigned DisableAllChecks : 1;
+  unsigned DisableAllCheckers : 1;
 
   unsigned ShowCheckerHelp : 1;
+  unsigned ShowCheckerHelpAlpha : 1;
+  unsigned ShowCheckerHelpDeveloper : 1;
+
+  unsigned ShowCheckerOptionList : 1;
+  unsigned ShowCheckerOptionAlphaList : 1;
+  unsigned ShowCheckerOptionDeveloperList : 1;
+
   unsigned ShowEnabledCheckerList : 1;
   unsigned ShowConfigOptionsList : 1;
+  unsigned ShouldEmitErrorsOnInvalidConfigValue : 1;
   unsigned AnalyzeAll : 1;
   unsigned AnalyzerDisplayProgress : 1;
   unsigned AnalyzeNestedBlocks : 1;
@@ -213,6 +254,9 @@ public:
   /// strategy. We get better code coverage when retry is enabled.
   unsigned NoRetryExhausted : 1;
 
+  /// Emit analyzer warnings as errors.
+  unsigned AnalyzerWerror : 1;
+
   /// The inlining stack depth limit.
   // Cap the stack depth at 4 calls (5 stack frames, base + 4 calls).
   unsigned InlineMaxStackDepth = 5;
@@ -220,130 +264,126 @@ public:
   /// The mode of function selection used during inlining.
   AnalysisInliningMode InliningMode = NoRedundancy;
 
-private:
-
-#define ANALYZER_OPTION(TYPE, NAME, CMDFLAG, DESC, DEFAULT_VAL)                \
-  Optional<TYPE> NAME;
+  // Create a field for each -analyzer-config option.
 #define ANALYZER_OPTION_DEPENDS_ON_USER_MODE(TYPE, NAME, CMDFLAG, DESC,        \
                                              SHALLOW_VAL, DEEP_VAL)            \
-  Optional<TYPE> NAME;
+  ANALYZER_OPTION(TYPE, NAME, CMDFLAG, DESC, SHALLOW_VAL)
+
+#define ANALYZER_OPTION(TYPE, NAME, CMDFLAG, DESC, DEFAULT_VAL)                \
+  TYPE NAME;
+
 #include "clang/StaticAnalyzer/Core/AnalyzerOptions.def"
 #undef ANALYZER_OPTION
 #undef ANALYZER_OPTION_DEPENDS_ON_USER_MODE
 
-  /// Query an option's string value.
-  ///
-  /// If an option value is not provided, returns the given \p DefaultVal.
-  /// @param [in] Name Name for option to retrieve.
-  /// @param [in] DefaultVal Default value returned if no such option was
-  /// specified.
-  StringRef getStringOption(StringRef OptionName, StringRef DefaultVal);
+  // Create an array of all -analyzer-config command line options. Sort it in
+  // the constructor.
+  std::vector<llvm::StringLiteral> AnalyzerConfigCmdFlags = {
+#define ANALYZER_OPTION_DEPENDS_ON_USER_MODE(TYPE, NAME, CMDFLAG, DESC,        \
+                                             SHALLOW_VAL, DEEP_VAL)            \
+  ANALYZER_OPTION(TYPE, NAME, CMDFLAG, DESC, SHALLOW_VAL)
 
-  void initOption(Optional<StringRef> &V, StringRef Name,
-                                          StringRef DefaultVal);
+#define ANALYZER_OPTION(TYPE, NAME, CMDFLAG, DESC, DEFAULT_VAL)                \
+  llvm::StringLiteral(CMDFLAG),
 
-  void initOption(Optional<bool> &V, StringRef Name, bool DefaultVal);
+#include "clang/StaticAnalyzer/Core/AnalyzerOptions.def"
+#undef ANALYZER_OPTION
+#undef ANALYZER_OPTION_DEPENDS_ON_USER_MODE
+  };
 
-  void initOption(Optional<unsigned> &V, StringRef Name,
-                                         unsigned DefaultVal);
-public:
+  bool isUnknownAnalyzerConfig(StringRef Name) const {
+
+    assert(std::is_sorted(AnalyzerConfigCmdFlags.begin(),
+                          AnalyzerConfigCmdFlags.end()));
+
+    return !std::binary_search(AnalyzerConfigCmdFlags.begin(),
+                               AnalyzerConfigCmdFlags.end(), Name);
+  }
+
   AnalyzerOptions()
-      : DisableAllChecks(false), ShowCheckerHelp(false),
-        ShowEnabledCheckerList(false), ShowConfigOptionsList(false),
-        AnalyzeAll(false), AnalyzerDisplayProgress(false),
-        AnalyzeNestedBlocks(false), eagerlyAssumeBinOpBifurcation(false),
-        TrimGraph(false), visualizeExplodedGraphWithGraphViz(false),
-        UnoptimizedCFG(false), PrintStats(false), NoRetryExhausted(false) {}
+      : DisableAllCheckers(false), ShowCheckerHelp(false),
+        ShowCheckerHelpAlpha(false), ShowCheckerHelpDeveloper(false),
+        ShowCheckerOptionList(false), ShowCheckerOptionAlphaList(false),
+        ShowCheckerOptionDeveloperList(false), ShowEnabledCheckerList(false),
+        ShowConfigOptionsList(false), AnalyzeAll(false),
+        AnalyzerDisplayProgress(false), AnalyzeNestedBlocks(false),
+        eagerlyAssumeBinOpBifurcation(false), TrimGraph(false),
+        visualizeExplodedGraphWithGraphViz(false), UnoptimizedCFG(false),
+        PrintStats(false), NoRetryExhausted(false), AnalyzerWerror(false) {
+    llvm::sort(AnalyzerConfigCmdFlags);
+  }
 
   /// Interprets an option's string value as a boolean. The "true" string is
   /// interpreted as true and the "false" string is interpreted as false.
   ///
   /// If an option value is not provided, returns the given \p DefaultVal.
-  /// @param [in] Name Name for option to retrieve.
-  /// @param [in] DefaultVal Default value returned if no such option was
-  /// specified.
-  /// @param [in] C The checker object the option belongs to. Checker options
-  /// are retrieved in the following format:
-  /// `-analyzer-config <package and checker name>:OptionName=Value.
+  /// @param [in] CheckerName The *full name* of the checker. One may retrieve
+  /// this from the checker object's field \c Name, or through \c
+  /// CheckerManager::getCurrentCheckerName within the checker's registry
+  /// function.
+  /// Checker options are retrieved in the following format:
+  /// `-analyzer-config CheckerName:OptionName=Value.
+  /// @param [in] OptionName Name for option to retrieve.
   /// @param [in] SearchInParents If set to true and the searched option was not
   /// specified for the given checker the options for the parent packages will
   /// be searched as well. The inner packages take precedence over the outer
   /// ones.
-  bool getCheckerBooleanOption(StringRef Name, bool DefaultVal,
-                        const ento::CheckerBase *C,
-                        bool SearchInParents = false) const;
+  bool getCheckerBooleanOption(StringRef CheckerName, StringRef OptionName,
+                               bool SearchInParents = false) const;
 
+  bool getCheckerBooleanOption(const ento::CheckerBase *C, StringRef OptionName,
+                               bool SearchInParents = false) const;
 
   /// Interprets an option's string value as an integer value.
   ///
   /// If an option value is not provided, returns the given \p DefaultVal.
-  /// @param [in] Name Name for option to retrieve.
-  /// @param [in] DefaultVal Default value returned if no such option was
-  /// specified.
-  /// @param [in] C The checker object the option belongs to. Checker options
-  /// are retrieved in the following format:
-  /// `-analyzer-config <package and checker name>:OptionName=Value.
+  /// @param [in] CheckerName The *full name* of the checker. One may retrieve
+  /// this from the checker object's field \c Name, or through \c
+  /// CheckerManager::getCurrentCheckerName within the checker's registry
+  /// function.
+  /// Checker options are retrieved in the following format:
+  /// `-analyzer-config CheckerName:OptionName=Value.
+  /// @param [in] OptionName Name for option to retrieve.
   /// @param [in] SearchInParents If set to true and the searched option was not
   /// specified for the given checker the options for the parent packages will
   /// be searched as well. The inner packages take precedence over the outer
   /// ones.
-  int getCheckerIntegerOption(StringRef Name, int DefaultVal,
-                         const ento::CheckerBase *C,
-                         bool SearchInParents = false) const;
+  int getCheckerIntegerOption(StringRef CheckerName, StringRef OptionName,
+                              bool SearchInParents = false) const;
+
+  int getCheckerIntegerOption(const ento::CheckerBase *C, StringRef OptionName,
+                              bool SearchInParents = false) const;
 
   /// Query an option's string value.
   ///
   /// If an option value is not provided, returns the given \p DefaultVal.
-  /// @param [in] Name Name for option to retrieve.
-  /// @param [in] DefaultVal Default value returned if no such option was
-  /// specified.
-  /// @param [in] C The checker object the option belongs to. Checker options
-  /// are retrieved in the following format:
-  /// `-analyzer-config <package and checker name>:OptionName=Value.
+  /// @param [in] CheckerName The *full name* of the checker. One may retrieve
+  /// this from the checker object's field \c Name, or through \c
+  /// CheckerManager::getCurrentCheckerName within the checker's registry
+  /// function.
+  /// Checker options are retrieved in the following format:
+  /// `-analyzer-config CheckerName:OptionName=Value.
+  /// @param [in] OptionName Name for option to retrieve.
   /// @param [in] SearchInParents If set to true and the searched option was not
   /// specified for the given checker the options for the parent packages will
   /// be searched as well. The inner packages take precedence over the outer
   /// ones.
-  StringRef getCheckerStringOption(StringRef Name, StringRef DefaultVal,
-                              const ento::CheckerBase *C,
-                              bool SearchInParents = false) const;
+  StringRef getCheckerStringOption(StringRef CheckerName, StringRef OptionName,
+                                   bool SearchInParents = false) const;
 
-#define ANALYZER_OPTION_GEN_FN(TYPE, NAME, CMDFLAG, DESC, DEFAULT_VAL,  \
-                               CREATE_FN)                               \
-  TYPE CREATE_FN() {                                                    \
-    initOption(NAME, CMDFLAG, DEFAULT_VAL);                             \
-    return NAME.getValue();                                             \
-  }
-
-#define ANALYZER_OPTION_GEN_FN_DEPENDS_ON_USER_MODE(                    \
-    TYPE, NAME, CMDFLAG, DESC, SHALLOW_VAL, DEEP_VAL, CREATE_FN)        \
-  TYPE CREATE_FN() {                                                    \
-    switch (getUserMode()) {                                            \
-    case UMK_Shallow:                                                   \
-      initOption(NAME, CMDFLAG, SHALLOW_VAL);                           \
-      break;                                                            \
-    case UMK_Deep:                                                      \
-      initOption(NAME, CMDFLAG, DEEP_VAL);                              \
-      break;                                                            \
-    }                                                                   \
-                                                                        \
-    return NAME.getValue();                                             \
-  }
-
-#include "clang/StaticAnalyzer/Core/AnalyzerOptions.def"
-
-#undef ANALYZER_OPTION_GEN_FN_DEPENDS_ON_USER_MODE
-#undef ANALYZER_OPTION_WITH_FN
+  StringRef getCheckerStringOption(const ento::CheckerBase *C,
+                                   StringRef OptionName,
+                                   bool SearchInParents = false) const;
 
   /// Retrieves and sets the UserMode. This is a high-level option,
   /// which is used to set other low-level options. It is not accessible
   /// outside of AnalyzerOptions.
-  UserModeKind getUserMode();
+  UserModeKind getUserMode() const;
 
-  ExplorationStrategyKind getExplorationStrategy();
+  ExplorationStrategyKind getExplorationStrategy() const;
 
   /// Returns the inter-procedural analysis mode.
-  IPAKind getIPAMode();
+  IPAKind getIPAMode() const;
 
   /// Returns the option controlling which C++ member functions will be
   /// considered for inlining.
@@ -351,12 +391,64 @@ public:
   /// This is controlled by the 'c++-inlining' config option.
   ///
   /// \sa CXXMemberInliningMode
-  bool mayInlineCXXMemberFunction(CXXInlineableMemberKind K);
-
-  StringRef getCTUDir();
+  bool mayInlineCXXMemberFunction(CXXInlineableMemberKind K) const;
 };
 
 using AnalyzerOptionsRef = IntrusiveRefCntPtr<AnalyzerOptions>;
+
+//===----------------------------------------------------------------------===//
+// We'll use AnalyzerOptions in the frontend, but we can't link the frontend
+// with clangStaticAnalyzerCore, because clangStaticAnalyzerCore depends on
+// clangFrontend.
+//
+// For this reason, implement some methods in this header file.
+//===----------------------------------------------------------------------===//
+
+inline UserModeKind AnalyzerOptions::getUserMode() const {
+  auto K = llvm::StringSwitch<llvm::Optional<UserModeKind>>(UserMode)
+    .Case("shallow", UMK_Shallow)
+    .Case("deep", UMK_Deep)
+    .Default(None);
+  assert(K.hasValue() && "User mode is invalid.");
+  return K.getValue();
+}
+
+inline std::vector<StringRef>
+AnalyzerOptions::getRegisteredCheckers(bool IncludeExperimental) {
+  static constexpr llvm::StringLiteral StaticAnalyzerCheckerNames[] = {
+#define GET_CHECKERS
+#define CHECKER(FULLNAME, CLASS, HELPTEXT, DOC_URI, IS_HIDDEN)                 \
+  llvm::StringLiteral(FULLNAME),
+#include "clang/StaticAnalyzer/Checkers/Checkers.inc"
+#undef CHECKER
+#undef GET_CHECKERS
+  };
+  std::vector<StringRef> Checkers;
+  for (StringRef CheckerName : StaticAnalyzerCheckerNames) {
+    if (!CheckerName.startswith("debug.") &&
+        (IncludeExperimental || !CheckerName.startswith("alpha.")))
+      Checkers.push_back(CheckerName);
+  }
+  return Checkers;
+}
+
+inline std::vector<StringRef>
+AnalyzerOptions::getRegisteredPackages(bool IncludeExperimental) {
+  static constexpr llvm::StringLiteral StaticAnalyzerPackageNames[] = {
+#define GET_PACKAGES
+#define PACKAGE(FULLNAME) llvm::StringLiteral(FULLNAME),
+#include "clang/StaticAnalyzer/Checkers/Checkers.inc"
+#undef PACKAGE
+#undef GET_PACKAGES
+  };
+  std::vector<StringRef> Packages;
+  for (StringRef PackageName : StaticAnalyzerPackageNames) {
+    if (PackageName != "debug" &&
+        (IncludeExperimental || PackageName != "alpha"))
+      Packages.push_back(PackageName);
+  }
+  return Packages;
+}
 
 } // namespace clang
 

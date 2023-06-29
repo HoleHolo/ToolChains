@@ -1,9 +1,8 @@
 //===- MemoryLocation.h - Memory location descriptions ----------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 /// \file
@@ -16,10 +15,11 @@
 #ifndef LLVM_ANALYSIS_MEMORYLOCATION_H
 #define LLVM_ANALYSIS_MEMORYLOCATION_H
 
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/DenseMapInfo.h"
-#include "llvm/IR/CallSite.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/Support/TypeSize.h"
 
 namespace llvm {
 
@@ -135,6 +135,9 @@ public:
     return (Value & ImpreciseBit) == 0;
   }
 
+  // Convenience method to check if this LocationSize's value is 0.
+  bool isZero() const { return hasValue() && getValue() == 0; }
+
   bool operator==(const LocationSize &Other) const {
     return Value == Other.Value;
   }
@@ -231,11 +234,17 @@ public:
   static MemoryLocation getForDest(const AnyMemIntrinsic *MI);
 
   /// Return a location representing a particular argument of a call.
-  static MemoryLocation getForArgument(ImmutableCallSite CS, unsigned ArgIdx,
+  static MemoryLocation getForArgument(const CallBase *Call, unsigned ArgIdx,
                                        const TargetLibraryInfo *TLI);
-  static MemoryLocation getForArgument(ImmutableCallSite CS, unsigned ArgIdx,
+  static MemoryLocation getForArgument(const CallBase *Call, unsigned ArgIdx,
                                        const TargetLibraryInfo &TLI) {
-    return getForArgument(CS, ArgIdx, &TLI);
+    return getForArgument(Call, ArgIdx, &TLI);
+  }
+
+  // Return the exact size if the exact size is known at compiletime,
+  // otherwise return MemoryLocation::UnknownSize.
+  static uint64_t getSizeOrUnknown(const TypeSize &T) {
+    return T.isScalable() ? UnknownSize : T.getFixedSize();
   }
 
   explicit MemoryLocation(const Value *Ptr = nullptr,

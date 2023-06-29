@@ -1,9 +1,8 @@
 //===-- llvm/CodeGen/ISDOpcodes.h - CodeGen opcodes -------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -13,6 +12,8 @@
 
 #ifndef LLVM_CODEGEN_ISDOPCODES_H
 #define LLVM_CODEGEN_ISDOPCODES_H
+
+#include "llvm/CodeGen/ValueTypes.h"
 
 namespace llvm {
 
@@ -272,6 +273,24 @@ namespace ISD {
     /// resulting value is this minimum value.
     SSUBSAT, USUBSAT,
 
+    /// RESULT = [US]MULFIX(LHS, RHS, SCALE) - Perform fixed point multiplication on
+    /// 2 integers with the same width and scale. SCALE represents the scale of
+    /// both operands as fixed point numbers. This SCALE parameter must be a
+    /// constant integer. A scale of zero is effectively performing
+    /// multiplication on 2 integers.
+    SMULFIX, UMULFIX,
+
+    /// Same as the corresponding unsaturated fixed point instructions, but the
+    /// result is clamped between the min and max values representable by the
+    /// bits of the first 2 operands.
+    SMULFIXSAT, UMULFIXSAT,
+
+    /// RESULT = [US]DIVFIX(LHS, RHS, SCALE) - Perform fixed point division on
+    /// 2 integers with the same width and scale. SCALE represents the scale
+    /// of both operands as fixed point numbers. This SCALE parameter must be a
+    /// constant integer.
+    SDIVFIX, UDIVFIX,
+
     /// Simple binary floating point operators.
     FADD, FSUB, FMUL, FDIV, FREM,
 
@@ -290,6 +309,48 @@ namespace ISD {
     STRICT_FEXP, STRICT_FEXP2, STRICT_FLOG, STRICT_FLOG10, STRICT_FLOG2,
     STRICT_FRINT, STRICT_FNEARBYINT, STRICT_FMAXNUM, STRICT_FMINNUM,
     STRICT_FCEIL, STRICT_FFLOOR, STRICT_FROUND, STRICT_FTRUNC,
+    STRICT_LROUND, STRICT_LLROUND, STRICT_LRINT, STRICT_LLRINT,
+    STRICT_FMAXIMUM, STRICT_FMINIMUM,
+
+    /// STRICT_FP_TO_[US]INT - Convert a floating point value to a signed or
+    /// unsigned integer. These have the same semantics as fptosi and fptoui 
+    /// in IR.
+    /// They are used to limit optimizations while the DAG is being optimized.
+    STRICT_FP_TO_SINT,
+    STRICT_FP_TO_UINT,
+
+    /// STRICT_[US]INT_TO_FP - Convert a signed or unsigned integer to
+    /// a floating point value. These have the same semantics as sitofp and
+    /// uitofp in IR.
+    /// They are used to limit optimizations while the DAG is being optimized.
+    STRICT_SINT_TO_FP,
+    STRICT_UINT_TO_FP,
+
+    /// X = STRICT_FP_ROUND(Y, TRUNC) - Rounding 'Y' from a larger floating 
+    /// point type down to the precision of the destination VT.  TRUNC is a 
+    /// flag, which is always an integer that is zero or one.  If TRUNC is 0,
+    /// this is a normal rounding, if it is 1, this FP_ROUND is known to not
+    /// change the value of Y.
+    ///
+    /// The TRUNC = 1 case is used in cases where we know that the value will
+    /// not be modified by the node, because Y is not using any of the extra
+    /// precision of source type.  This allows certain transformations like
+    /// STRICT_FP_EXTEND(STRICT_FP_ROUND(X,1)) -> X which are not safe for
+    /// STRICT_FP_EXTEND(STRICT_FP_ROUND(X,0)) because the extra bits aren't
+    /// removed.
+    /// It is used to limit optimizations while the DAG is being optimized.
+    STRICT_FP_ROUND,
+
+    /// X = STRICT_FP_EXTEND(Y) - Extend a smaller FP type into a larger FP
+    /// type.
+    /// It is used to limit optimizations while the DAG is being optimized.
+    STRICT_FP_EXTEND,
+
+    /// STRICT_FSETCC/STRICT_FSETCCS - Constrained versions of SETCC, used
+    /// for floating-point operands only.  STRICT_FSETCC performs a quiet
+    /// comparison operation, while STRICT_FSETCCS performs a signaling
+    /// comparison operation.
+    STRICT_FSETCC, STRICT_FSETCCS,
 
     /// FMA - Perform a * b + c with no intermediate rounding step.
     FMA,
@@ -367,6 +428,13 @@ namespace ISD {
     /// than the vector element type, and is implicitly truncated to it.
     SCALAR_TO_VECTOR,
 
+    /// SPLAT_VECTOR(VAL) - Returns a vector with the scalar value VAL
+    /// duplicated in all lanes. The type of the operand must match the vector
+    /// element type, except when they are integer types.  In this case the
+    /// operand is allowed to be wider than the vector element type, and is
+    /// implicitly truncated to it.
+    SPLAT_VECTOR,
+
     /// MULHU/MULHS - Multiply high - Multiply two integers of type iN,
     /// producing an unsigned/signed value of type i[2*N], then return the top
     /// part.
@@ -394,9 +462,13 @@ namespace ISD {
     /// When the 1st operand is a vector, the shift amount must be in the same
     /// type. (TLI.getShiftAmountTy() will return the same type when the input
     /// type is a vector.)
-    /// For rotates, the shift amount is treated as an unsigned amount modulo
-    /// the element size of the first operand.
-    SHL, SRA, SRL, ROTL, ROTR,
+    /// For rotates and funnel shifts, the shift amount is treated as an unsigned
+    /// amount modulo the element size of the first operand.
+    ///
+    /// Funnel 'double' shifts take 3 operands, 2 inputs and the shift amount.
+    /// fshl(X,Y,Z): (X << (Z % BW)) | (Y >> (BW - (Z % BW)))
+    /// fshr(X,Y,Z): (X << (BW - (Z % BW))) | (Y >> (Z % BW))
+    SHL, SRA, SRL, ROTL, ROTR, FSHL, FSHR,
 
     /// Byte Swap and Counting operators.
     BSWAP, CTTZ, CTLZ, CTPOP, BITREVERSE,
@@ -478,31 +550,33 @@ namespace ISD {
     /// in-register any-extension of the low lanes of an integer vector. The
     /// result type must have fewer elements than the operand type, and those
     /// elements must be larger integer types such that the total size of the
-    /// operand type and the result type match. Each of the low operand
-    /// elements is any-extended into the corresponding, wider result
-    /// elements with the high bits becoming undef.
+    /// operand type is less than or equal to the size of the result type. Each
+    /// of the low operand elements is any-extended into the corresponding,
+    /// wider result elements with the high bits becoming undef.
+    /// NOTE: The type legalizer prefers to make the operand and result size
+    /// the same to allow expansion to shuffle vector during op legalization.
     ANY_EXTEND_VECTOR_INREG,
 
     /// SIGN_EXTEND_VECTOR_INREG(Vector) - This operator represents an
     /// in-register sign-extension of the low lanes of an integer vector. The
     /// result type must have fewer elements than the operand type, and those
     /// elements must be larger integer types such that the total size of the
-    /// operand type and the result type match. Each of the low operand
-    /// elements is sign-extended into the corresponding, wider result
-    /// elements.
-    // FIXME: The SIGN_EXTEND_INREG node isn't specifically limited to
-    // scalars, but it also doesn't handle vectors well. Either it should be
-    // restricted to scalars or this node (and its handling) should be merged
-    // into it.
+    /// operand type is less than or equal to the size of the result type. Each
+    /// of the low operand elements is sign-extended into the corresponding,
+    /// wider result elements.
+    /// NOTE: The type legalizer prefers to make the operand and result size
+    /// the same to allow expansion to shuffle vector during op legalization.
     SIGN_EXTEND_VECTOR_INREG,
 
     /// ZERO_EXTEND_VECTOR_INREG(Vector) - This operator represents an
     /// in-register zero-extension of the low lanes of an integer vector. The
     /// result type must have fewer elements than the operand type, and those
     /// elements must be larger integer types such that the total size of the
-    /// operand type and the result type match. Each of the low operand
-    /// elements is zero-extended into the corresponding, wider result
-    /// elements.
+    /// operand type is less than or equal to the size of the result type. Each
+    /// of the low operand elements is zero-extended into the corresponding,
+    /// wider result elements.
+    /// NOTE: The type legalizer prefers to make the operand and result size
+    /// the same to allow expansion to shuffle vector during op legalization.
     ZERO_EXTEND_VECTOR_INREG,
 
     /// FP_TO_[US]INT - Convert a floating point value to a signed or unsigned
@@ -532,13 +606,6 @@ namespace ISD {
     ///  3 Round to -inf
     FLT_ROUNDS_,
 
-    /// X = FP_ROUND_INREG(Y, VT) - This operator takes an FP register, and
-    /// rounds it to a floating point value.  It then promotes it and returns it
-    /// in a register of the same size.  This operation effectively just
-    /// discards excess precision.  The type to round down to is specified by
-    /// the VT operand, a VTSDNode.
-    FP_ROUND_INREG,
-
     /// X = FP_EXTEND(Y) - Extend a smaller FP type into a larger FP type.
     FP_EXTEND,
 
@@ -567,10 +634,14 @@ namespace ISD {
     /// is often a storage-only type but has native conversions.
     FP16_TO_FP, FP_TO_FP16,
 
-    /// Perform various unary floating-point operations inspired by libm.
+    /// Perform various unary floating-point operations inspired by libm. For
+    /// FPOWI, the result is undefined if if the integer operand doesn't fit
+    /// into 32 bits.
     FNEG, FABS, FSQRT, FCBRT, FSIN, FCOS, FPOWI, FPOW,
     FLOG, FLOG2, FLOG10, FEXP, FEXP2,
     FCEIL, FTRUNC, FRINT, FNEARBYINT, FROUND, FFLOOR,
+    LROUND, LLROUND, LRINT, LLRINT,
+
     /// FMINNUM/FMAXNUM - Perform floating-point minimum or maximum on two
     /// values.
     //
@@ -653,6 +724,9 @@ namespace ISD {
     /// SDOperands.
     INLINEASM,
 
+    /// INLINEASM_BR - Terminator version of inline asm. Used by asm-goto.
+    INLINEASM_BR,
+
     /// EH_LABEL - Represents a label in mid basic block used to track
     /// locations needed for debug and exception handling tables.  These nodes
     /// take a chain as input and return a chain.
@@ -663,9 +737,6 @@ namespace ISD {
     /// with respect to other call instructions, but loads and stores may float
     /// past it.
     ANNOTATION_LABEL,
-
-    /// CATCHPAD - Represents a catchpad instruction.
-    CATCHPAD,
 
     /// CATCHRET - Represents a return from a catch block funclet. Used for
     /// MSVC compatible exception handling. Takes a chain operand and a
@@ -806,6 +877,8 @@ namespace ISD {
     ATOMIC_LOAD_MAX,
     ATOMIC_LOAD_UMIN,
     ATOMIC_LOAD_UMAX,
+    ATOMIC_LOAD_FADD,
+    ATOMIC_LOAD_FSUB,
 
     // Masked load and store - consecutive vector load and store operations
     // with additional mask operand that prevents memory accesses to the
@@ -845,6 +918,11 @@ namespace ISD {
     /// known nonzero constant. The only operand here is the chain.
     GET_DYNAMIC_AREA_OFFSET,
 
+    /// VSCALE(IMM) - Returns the runtime scaling factor used to calculate the
+    /// number of elements within a scalable vector. IMM is a constant integer
+    /// multiplier that is applied to the runtime value.
+    VSCALE,
+
     /// Generic reduction nodes. These nodes represent horizontal vector
     /// reduction operations, producing a scalar result.
     /// The STRICT variants perform reductions in sequential order. The first
@@ -853,22 +931,30 @@ namespace ISD {
     VECREDUCE_STRICT_FADD, VECREDUCE_STRICT_FMUL,
     /// These reductions are non-strict, and have a single vector operand.
     VECREDUCE_FADD, VECREDUCE_FMUL,
+    /// FMIN/FMAX nodes can have flags, for NaN/NoNaN variants.
+    VECREDUCE_FMAX, VECREDUCE_FMIN,
+    /// Integer reductions may have a result type larger than the vector element
+    /// type. However, the reduction is performed using the vector element type
+    /// and the value in the top bits is unspecified.
     VECREDUCE_ADD, VECREDUCE_MUL,
     VECREDUCE_AND, VECREDUCE_OR, VECREDUCE_XOR,
     VECREDUCE_SMAX, VECREDUCE_SMIN, VECREDUCE_UMAX, VECREDUCE_UMIN,
-    /// FMIN/FMAX nodes can have flags, for NaN/NoNaN variants.
-    VECREDUCE_FMAX, VECREDUCE_FMIN,
 
     /// BUILTIN_OP_END - This must be the last enum value in this list.
     /// The target-specific pre-isel opcode values start here.
     BUILTIN_OP_END
   };
 
+  /// FIRST_TARGET_STRICTFP_OPCODE - Target-specific pre-isel operations
+  /// which cannot raise FP exceptions should be less than this value.
+  /// Those that do must not be less than this value.
+  static const int FIRST_TARGET_STRICTFP_OPCODE = BUILTIN_OP_END+400;
+
   /// FIRST_TARGET_MEMORY_OPCODE - Target-specific pre-isel operations
   /// which do not reference a specific memory location should be less than
   /// this value. Those that do must not be less than this value, and can
   /// be used with SelectionDAG::getMemIntrinsicNode.
-  static const int FIRST_TARGET_MEMORY_OPCODE = BUILTIN_OP_END+400;
+  static const int FIRST_TARGET_MEMORY_OPCODE = BUILTIN_OP_END+500;
 
   //===--------------------------------------------------------------------===//
   /// MemIndexedMode enum - This enum defines the load / store indexed
@@ -907,6 +993,23 @@ namespace ISD {
   };
 
   static const int LAST_INDEXED_MODE = POST_DEC + 1;
+
+  //===--------------------------------------------------------------------===//
+  /// MemIndexType enum - This enum defines how to interpret MGATHER/SCATTER's
+  /// index parameter when calculating addresses.
+  ///
+  /// SIGNED_SCALED     Addr = Base + ((signed)Index * sizeof(element))
+  /// SIGNED_UNSCALED   Addr = Base + (signed)Index
+  /// UNSIGNED_SCALED   Addr = Base + ((unsigned)Index * sizeof(element))
+  /// UNSIGNED_UNSCALED Addr = Base + (unsigned)Index
+  enum MemIndexType {
+    SIGNED_SCALED = 0,
+    SIGNED_UNSCALED,
+    UNSIGNED_SCALED,
+    UNSIGNED_UNSCALED
+  };
+
+  static const int LAST_MEM_INDEX_TYPE = UNSIGNED_UNSCALED + 1;
 
   //===--------------------------------------------------------------------===//
   /// LoadExtType enum - This enum defines the three variants of LOADEXT
@@ -1002,7 +1105,17 @@ namespace ISD {
 
   /// Return the operation corresponding to !(X op Y), where 'op' is a valid
   /// SetCC operation.
-  CondCode getSetCCInverse(CondCode Operation, bool isInteger);
+  CondCode getSetCCInverse(CondCode Operation, EVT Type);
+
+  namespace GlobalISel {
+    /// Return the operation corresponding to !(X op Y), where 'op' is a valid
+    /// SetCC operation. The U bit of the condition code has different meanings
+    /// between floating point and integer comparisons and LLT's don't provide
+    /// this distinction. As such we need to be told whether the comparison is
+    /// floating point or integer-like. Pointers should use integer-like
+    /// comparisons.
+    CondCode getSetCCInverse(CondCode Operation, bool isIntegerLike);
+  } // end namespace GlobalISel
 
   /// Return the operation corresponding to (Y op X) when given the operation
   /// for (X op Y).
@@ -1011,12 +1124,12 @@ namespace ISD {
   /// Return the result of a logical OR between different comparisons of
   /// identical values: ((X op1 Y) | (X op2 Y)). This function returns
   /// SETCC_INVALID if it is not possible to represent the resultant comparison.
-  CondCode getSetCCOrOperation(CondCode Op1, CondCode Op2, bool isInteger);
+  CondCode getSetCCOrOperation(CondCode Op1, CondCode Op2, EVT Type);
 
   /// Return the result of a logical AND between different comparisons of
   /// identical values: ((X op1 Y) & (X op2 Y)). This function returns
   /// SETCC_INVALID if it is not possible to represent the resultant comparison.
-  CondCode getSetCCAndOperation(CondCode Op1, CondCode Op2, bool isInteger);
+  CondCode getSetCCAndOperation(CondCode Op1, CondCode Op2, EVT Type);
 
 } // end llvm::ISD namespace
 

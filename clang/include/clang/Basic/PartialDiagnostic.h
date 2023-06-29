@@ -1,9 +1,8 @@
 //===- PartialDiagnostic.h - Diagnostic "closures" --------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -286,7 +285,7 @@ public:
            "Too many arguments to diagnostic!");
     DiagStorage->DiagArgumentsKind[DiagStorage->NumDiagArgs]
       = DiagnosticsEngine::ak_std_string;
-    DiagStorage->DiagArgumentsStr[DiagStorage->NumDiagArgs++] = V;
+    DiagStorage->DiagArgumentsStr[DiagStorage->NumDiagArgs++] = std::string(V);
   }
 
   void Emit(const DiagnosticBuilder &DB) const {

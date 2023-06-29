@@ -1,9 +1,8 @@
 //===- llvm/Transforms/IPO.h - Interprocedural Transformations --*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -85,10 +84,12 @@ ModulePass *createEliminateAvailableExternallyPass();
 //===----------------------------------------------------------------------===//
 /// createGVExtractionPass - If deleteFn is true, this pass deletes
 /// the specified global values. Otherwise, it deletes as much of the module as
-/// possible, except for the global values specified.
+/// possible, except for the global values specified. If keepConstInit is true,
+/// the initializers of global constants are not deleted even if they are
+/// unused.
 ///
 ModulePass *createGVExtractionPass(std::vector<GlobalValue*>& GVs, bool
-                                   deleteFn = false);
+                                  deleteFn = false, bool keepConstInit = false);
 
 //===----------------------------------------------------------------------===//
 /// This pass performs iterative function importing from other modules.
@@ -183,6 +184,10 @@ ModulePass *createBlockExtractorPass();
 ModulePass *
 createBlockExtractorPass(const SmallVectorImpl<BasicBlock *> &BlocksToExtract,
                          bool EraseFunctions);
+ModulePass *
+createBlockExtractorPass(const SmallVectorImpl<SmallVector<BasicBlock *, 16>>
+                             &GroupsOfBlocksToExtract,
+                         bool EraseFunctions);
 
 /// createStripDeadPrototypesPass - This pass removes any function declarations
 /// (prototypes) that are not used.
@@ -233,12 +238,15 @@ enum class PassSummaryAction {
 /// The behavior depends on the summary arguments:
 /// - If ExportSummary is non-null, this pass will export type identifiers to
 ///   the given summary.
-/// - Otherwise, if ImportSummary is non-null, this pass will import type
-///   identifiers from the given summary.
-/// - Otherwise it does neither.
-/// It is invalid for both ExportSummary and ImportSummary to be non-null.
+/// - If ImportSummary is non-null, this pass will import type identifiers from
+///   the given summary.
+/// - Otherwise, if both are null and DropTypeTests is true, all type test
+///   assume sequences will be removed from the IR.
+/// It is invalid for both ExportSummary and ImportSummary to be non-null
+/// unless DropTypeTests is true.
 ModulePass *createLowerTypeTestsPass(ModuleSummaryIndex *ExportSummary,
-                                     const ModuleSummaryIndex *ImportSummary);
+                                     const ModuleSummaryIndex *ImportSummary,
+                                     bool DropTypeTests = false);
 
 /// This pass export CFI checks for use by external modules.
 ModulePass *createCrossDSOCFIPass();

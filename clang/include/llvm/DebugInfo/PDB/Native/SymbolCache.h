@@ -1,9 +1,8 @@
 //==- SymbolCache.h - Cache of native symbols and ids ------------*- C++ -*-==//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,7 +14,6 @@
 #include "llvm/DebugInfo/CodeView/TypeIndex.h"
 #include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/PDB/Native/NativeRawSymbol.h"
-#include "llvm/Support/Allocator.h"
 
 #include <memory>
 #include <vector>
@@ -88,7 +86,7 @@ public:
 
     // Initial construction must not access the cache, since it must be done
     // atomically.
-    auto Result = llvm::make_unique<ConcreteSymbolT>(
+    auto Result = std::make_unique<ConcreteSymbolT>(
         Session, Id, std::forward<Args>(ConstructorArgs)...);
     Result->SymbolId = Id;
 

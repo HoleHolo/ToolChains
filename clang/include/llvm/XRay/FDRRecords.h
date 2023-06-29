@@ -1,9 +1,8 @@
 //===- FDRRecords.h - XRay Flight Data Recorder Mode Records --------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -14,10 +13,14 @@
 #ifndef LLVM_LIB_XRAY_FDRRECORDS_H_
 #define LLVM_LIB_XRAY_FDRRECORDS_H_
 
+#include <cstdint>
+#include <string>
+
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/DataExtractor.h"
 #include "llvm/Support/Error.h"
 #include "llvm/XRay/XRayRecord.h"
-#include <cstdint>
 
 namespace llvm {
 namespace xray {
@@ -26,21 +29,37 @@ class RecordVisitor;
 class RecordInitializer;
 
 class Record {
-protected:
-  enum class Type {
-    Unknown,
-    Function,
-    Metadata,
+public:
+  enum class RecordKind {
+    RK_Metadata,
+    RK_Metadata_BufferExtents,
+    RK_Metadata_WallClockTime,
+    RK_Metadata_NewCPUId,
+    RK_Metadata_TSCWrap,
+    RK_Metadata_CustomEvent,
+    RK_Metadata_CustomEventV5,
+    RK_Metadata_CallArg,
+    RK_Metadata_PIDEntry,
+    RK_Metadata_NewBuffer,
+    RK_Metadata_EndOfBuffer,
+    RK_Metadata_TypedEvent,
+    RK_Metadata_LastMetadata,
+    RK_Function,
   };
+
+  static StringRef kindToString(RecordKind K);
+
+private:
+  const RecordKind T;
 
 public:
   Record(const Record &) = delete;
   Record(Record &&) = delete;
   Record &operator=(const Record &) = delete;
   Record &operator=(Record &&) = delete;
-  Record() = default;
+  explicit Record(RecordKind T) : T(T) {}
 
-  virtual Type type() const = 0;
+  RecordKind getRecordType() const { return T; }
 
   // Each Record should be able to apply an abstract visitor, and choose the
   // appropriate function in the visitor to invoke, given its own type.
@@ -50,10 +69,6 @@ public:
 };
 
 class MetadataRecord : public Record {
-protected:
-  static constexpr int kMetadataBodySize = 15;
-  friend class RecordInitializer;
-
 public:
   enum class MetadataType : unsigned {
     Unknown,
@@ -69,11 +84,22 @@ public:
     TypedEvent,
   };
 
-  Type type() const override { return Type::Metadata; }
+protected:
+  static constexpr int kMetadataBodySize = 15;
+  friend class RecordInitializer;
 
-  // All metadata records must know to provide the type of their open
-  // metadata record.
-  virtual MetadataType metadataType() const = 0;
+private:
+  const MetadataType MT;
+
+public:
+  explicit MetadataRecord(RecordKind T, MetadataType M) : Record(T), MT(M) {}
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() >= RecordKind::RK_Metadata &&
+           R->getRecordType() <= RecordKind::RK_Metadata_LastMetadata;
+  }
+
+  MetadataType metadataType() const { return MT; }
 
   virtual ~MetadataRecord() = default;
 };
@@ -86,16 +112,22 @@ class BufferExtents : public MetadataRecord {
   friend class RecordInitializer;
 
 public:
-  BufferExtents() = default;
-  explicit BufferExtents(uint64_t S) : MetadataRecord(), Size(S) {}
+  BufferExtents()
+      : MetadataRecord(RecordKind::RK_Metadata_BufferExtents,
+                       MetadataType::BufferExtents) {}
 
-  MetadataType metadataType() const override {
-    return MetadataType::BufferExtents;
-  }
+  explicit BufferExtents(uint64_t S)
+      : MetadataRecord(RecordKind::RK_Metadata_BufferExtents,
+                       MetadataType::BufferExtents),
+        Size(S) {}
 
   uint64_t size() const { return Size; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_BufferExtents;
+  }
 };
 
 class WallclockRecord : public MetadataRecord {
@@ -104,18 +136,23 @@ class WallclockRecord : public MetadataRecord {
   friend class RecordInitializer;
 
 public:
-  WallclockRecord() = default;
-  explicit WallclockRecord(uint64_t S, uint32_t N)
-      : MetadataRecord(), Seconds(S), Nanos(N) {}
+  WallclockRecord()
+      : MetadataRecord(RecordKind::RK_Metadata_WallClockTime,
+                       MetadataType::WallClockTime) {}
 
-  MetadataType metadataType() const override {
-    return MetadataType::WallClockTime;
-  }
+  explicit WallclockRecord(uint64_t S, uint32_t N)
+      : MetadataRecord(RecordKind::RK_Metadata_WallClockTime,
+                       MetadataType::WallClockTime),
+        Seconds(S), Nanos(N) {}
 
   uint64_t seconds() const { return Seconds; }
   uint32_t nanos() const { return Nanos; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_WallClockTime;
+  }
 };
 
 class NewCPUIDRecord : public MetadataRecord {
@@ -124,16 +161,24 @@ class NewCPUIDRecord : public MetadataRecord {
   friend class RecordInitializer;
 
 public:
-  NewCPUIDRecord() = default;
-  NewCPUIDRecord(uint16_t C, uint64_t T) : MetadataRecord(), CPUId(C), TSC(T) {}
+  NewCPUIDRecord()
+      : MetadataRecord(RecordKind::RK_Metadata_NewCPUId,
+                       MetadataType::NewCPUId) {}
 
-  MetadataType metadataType() const override { return MetadataType::NewCPUId; }
+  NewCPUIDRecord(uint16_t C, uint64_t T)
+      : MetadataRecord(RecordKind::RK_Metadata_NewCPUId,
+                       MetadataType::NewCPUId),
+        CPUId(C), TSC(T) {}
 
   uint16_t cpuid() const { return CPUId; }
 
   uint64_t tsc() const { return TSC; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_NewCPUId;
+  }
 };
 
 class TSCWrapRecord : public MetadataRecord {
@@ -141,14 +186,21 @@ class TSCWrapRecord : public MetadataRecord {
   friend class RecordInitializer;
 
 public:
-  TSCWrapRecord() = default;
-  explicit TSCWrapRecord(uint64_t B) : MetadataRecord(), BaseTSC(B) {}
+  TSCWrapRecord()
+      : MetadataRecord(RecordKind::RK_Metadata_TSCWrap, MetadataType::TSCWrap) {
+  }
 
-  MetadataType metadataType() const override { return MetadataType::TSCWrap; }
+  explicit TSCWrapRecord(uint64_t B)
+      : MetadataRecord(RecordKind::RK_Metadata_TSCWrap, MetadataType::TSCWrap),
+        BaseTSC(B) {}
 
   uint64_t tsc() const { return BaseTSC; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_TSCWrap;
+  }
 };
 
 class CustomEventRecord : public MetadataRecord {
@@ -159,13 +211,14 @@ class CustomEventRecord : public MetadataRecord {
   friend class RecordInitializer;
 
 public:
-  CustomEventRecord() = default;
-  explicit CustomEventRecord(uint64_t S, uint64_t T, uint16_t C, std::string D)
-      : MetadataRecord(), Size(S), TSC(T), CPU(C), Data(std::move(D)) {}
+  CustomEventRecord()
+      : MetadataRecord(RecordKind::RK_Metadata_CustomEvent,
+                       MetadataType::CustomEvent) {}
 
-  MetadataType metadataType() const override {
-    return MetadataType::CustomEvent;
-  }
+  explicit CustomEventRecord(uint64_t S, uint64_t T, uint16_t C, std::string D)
+      : MetadataRecord(RecordKind::RK_Metadata_CustomEvent,
+                       MetadataType::CustomEvent),
+        Size(S), TSC(T), CPU(C), Data(std::move(D)) {}
 
   int32_t size() const { return Size; }
   uint64_t tsc() const { return TSC; }
@@ -173,6 +226,10 @@ public:
   StringRef data() const { return Data; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_CustomEvent;
+  }
 };
 
 class CustomEventRecordV5 : public MetadataRecord {
@@ -182,19 +239,24 @@ class CustomEventRecordV5 : public MetadataRecord {
   friend class RecordInitializer;
 
 public:
-  CustomEventRecordV5() = default;
-  explicit CustomEventRecordV5(int32_t S, int32_t D, std::string P)
-      : MetadataRecord(), Size(S), Delta(D), Data(std::move(P)) {}
+  CustomEventRecordV5()
+      : MetadataRecord(RecordKind::RK_Metadata_CustomEventV5,
+                       MetadataType::CustomEvent) {}
 
-  MetadataType metadataType() const override {
-    return MetadataType::CustomEvent;
-  }
+  explicit CustomEventRecordV5(int32_t S, int32_t D, std::string P)
+      : MetadataRecord(RecordKind::RK_Metadata_CustomEventV5,
+                       MetadataType::CustomEvent),
+        Size(S), Delta(D), Data(std::move(P)) {}
 
   int32_t size() const { return Size; }
   int32_t delta() const { return Delta; }
   StringRef data() const { return Data; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_CustomEventV5;
+  }
 };
 
 class TypedEventRecord : public MetadataRecord {
@@ -205,13 +267,14 @@ class TypedEventRecord : public MetadataRecord {
   friend class RecordInitializer;
 
 public:
-  TypedEventRecord() = default;
-  explicit TypedEventRecord(int32_t S, int32_t D, uint16_t E, std::string P)
-      : MetadataRecord(), Size(S), Delta(D), Data(std::move(P)) {}
+  TypedEventRecord()
+      : MetadataRecord(RecordKind::RK_Metadata_TypedEvent,
+                       MetadataType::TypedEvent) {}
 
-  MetadataType metadataType() const override {
-    return MetadataType::TypedEvent;
-  }
+  explicit TypedEventRecord(int32_t S, int32_t D, uint16_t E, std::string P)
+      : MetadataRecord(RecordKind::RK_Metadata_TypedEvent,
+                       MetadataType::TypedEvent),
+        Size(S), Delta(D), Data(std::move(P)) {}
 
   int32_t size() const { return Size; }
   int32_t delta() const { return Delta; }
@@ -219,21 +282,32 @@ public:
   StringRef data() const { return Data; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_TypedEvent;
+  }
 };
 
 class CallArgRecord : public MetadataRecord {
-  uint64_t Arg;
+  uint64_t Arg = 0;
   friend class RecordInitializer;
 
 public:
-  CallArgRecord() = default;
-  explicit CallArgRecord(uint64_t A) : MetadataRecord(), Arg(A) {}
+  CallArgRecord()
+      : MetadataRecord(RecordKind::RK_Metadata_CallArg, MetadataType::CallArg) {
+  }
 
-  MetadataType metadataType() const override { return MetadataType::CallArg; }
+  explicit CallArgRecord(uint64_t A)
+      : MetadataRecord(RecordKind::RK_Metadata_CallArg, MetadataType::CallArg),
+        Arg(A) {}
 
   uint64_t arg() const { return Arg; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_CallArg;
+  }
 };
 
 class PIDRecord : public MetadataRecord {
@@ -241,14 +315,22 @@ class PIDRecord : public MetadataRecord {
   friend class RecordInitializer;
 
 public:
-  PIDRecord() = default;
-  explicit PIDRecord(int32_t P) : MetadataRecord(), PID(P) {}
+  PIDRecord()
+      : MetadataRecord(RecordKind::RK_Metadata_PIDEntry,
+                       MetadataType::PIDEntry) {}
 
-  MetadataType metadataType() const override { return MetadataType::PIDEntry; }
+  explicit PIDRecord(int32_t P)
+      : MetadataRecord(RecordKind::RK_Metadata_PIDEntry,
+                       MetadataType::PIDEntry),
+        PID(P) {}
 
   int32_t pid() const { return PID; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_PIDEntry;
+  }
 };
 
 class NewBufferRecord : public MetadataRecord {
@@ -256,41 +338,50 @@ class NewBufferRecord : public MetadataRecord {
   friend class RecordInitializer;
 
 public:
-  NewBufferRecord() = default;
-  explicit NewBufferRecord(int32_t T) : MetadataRecord(), TID(T) {}
+  NewBufferRecord()
+      : MetadataRecord(RecordKind::RK_Metadata_NewBuffer,
+                       MetadataType::NewBuffer) {}
 
-  MetadataType metadataType() const override { return MetadataType::NewBuffer; }
+  explicit NewBufferRecord(int32_t T)
+      : MetadataRecord(RecordKind::RK_Metadata_NewBuffer,
+                       MetadataType::NewBuffer),
+        TID(T) {}
 
   int32_t tid() const { return TID; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_NewBuffer;
+  }
 };
 
 class EndBufferRecord : public MetadataRecord {
 public:
-  EndBufferRecord() = default;
-
-  MetadataType metadataType() const override {
-    return MetadataType::EndOfBuffer;
-  }
+  EndBufferRecord()
+      : MetadataRecord(RecordKind::RK_Metadata_EndOfBuffer,
+                       MetadataType::EndOfBuffer) {}
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Metadata_EndOfBuffer;
+  }
 };
 
 class FunctionRecord : public Record {
   RecordTypes Kind;
-  int32_t FuncId;
-  uint32_t Delta;
+  int32_t FuncId = 0;
+  uint32_t Delta = 0;
   friend class RecordInitializer;
 
   static constexpr unsigned kFunctionRecordSize = 8;
 
 public:
-  FunctionRecord() = default;
-  explicit FunctionRecord(RecordTypes K, int32_t F, uint32_t D)
-      : Record(), Kind(K), FuncId(F), Delta(D) {}
+  FunctionRecord() : Record(RecordKind::RK_Function) {}
 
-  Type type() const override { return Type::Function; }
+  explicit FunctionRecord(RecordTypes K, int32_t F, uint32_t D)
+      : Record(RecordKind::RK_Function), Kind(K), FuncId(F), Delta(D) {}
 
   // A function record is a concrete record type which has a number of common
   // properties.
@@ -299,6 +390,10 @@ public:
   uint32_t delta() const { return Delta; }
 
   Error apply(RecordVisitor &V) override;
+
+  static bool classof(const Record *R) {
+    return R->getRecordType() == RecordKind::RK_Function;
+  }
 };
 
 class RecordVisitor {
@@ -322,16 +417,16 @@ public:
 
 class RecordInitializer : public RecordVisitor {
   DataExtractor &E;
-  uint32_t &OffsetPtr;
+  uint64_t &OffsetPtr;
   uint16_t Version;
 
 public:
   static constexpr uint16_t DefaultVersion = 5u;
 
-  explicit RecordInitializer(DataExtractor &DE, uint32_t &OP, uint16_t V)
+  explicit RecordInitializer(DataExtractor &DE, uint64_t &OP, uint16_t V)
       : RecordVisitor(), E(DE), OffsetPtr(OP), Version(V) {}
 
-  explicit RecordInitializer(DataExtractor &DE, uint32_t &OP)
+  explicit RecordInitializer(DataExtractor &DE, uint64_t &OP)
       : RecordInitializer(DE, OP, DefaultVersion) {}
 
   Error visit(BufferExtents &) override;

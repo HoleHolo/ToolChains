@@ -1,9 +1,8 @@
 //===- ValueHandle.h - Value Smart Pointer classes --------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -90,7 +89,11 @@ public:
   }
 
   Value *operator->() const { return getValPtr(); }
-  Value &operator*() const { return *getValPtr(); }
+  Value &operator*() const {
+    Value *V = getValPtr();
+    assert(V && "Dereferencing deleted ValueHandle");
+    return *V;
+  }
 
 protected:
   Value *getValPtr() const { return Val; }
@@ -170,6 +173,25 @@ template <> struct simplify_type<const WeakVH> {
   using SimpleType = Value *;
 
   static SimpleType getSimplifiedValue(const WeakVH &WVH) { return WVH; }
+};
+
+// Specialize DenseMapInfo to allow WeakVH to participate in DenseMap.
+template <> struct DenseMapInfo<WeakVH> {
+  static inline WeakVH getEmptyKey() {
+    return WeakVH(DenseMapInfo<Value *>::getEmptyKey());
+  }
+
+  static inline WeakVH getTombstoneKey() {
+    return WeakVH(DenseMapInfo<Value *>::getTombstoneKey());
+  }
+
+  static unsigned getHashValue(const WeakVH &Val) {
+    return DenseMapInfo<Value *>::getHashValue(Val);
+  }
+
+  static bool isEqual(const WeakVH &LHS, const WeakVH &RHS) {
+    return DenseMapInfo<Value *>::isEqual(LHS, RHS);
+  }
 };
 
 /// Value handle that is nullable, but tries to track the Value.
@@ -265,6 +287,7 @@ public:
 #else
   AssertingVH() : ThePtr(nullptr) {}
   AssertingVH(ValueTy *P) : ThePtr(GetAsValue(P)) {}
+  AssertingVH(const AssertingVH<ValueTy> &) = default;
 #endif
 
   operator ValueTy*() const {
@@ -307,15 +330,6 @@ struct DenseMapInfo<AssertingVH<T>> {
     return DenseMapInfo<Value *>::isEqual(LHS.getRawValPtr(),
                                           RHS.getRawValPtr());
   }
-};
-
-template <typename T>
-struct isPodLike<AssertingVH<T>> {
-#ifdef NDEBUG
-  static const bool value = true;
-#else
-  static const bool value = false;
-#endif
 };
 
 /// Value handle that tracks a Value across RAUW.
@@ -547,14 +561,6 @@ template <typename T> struct DenseMapInfo<PoisoningVH<T>> {
     return DenseMapInfo<Value *>::isEqual(LHS.getRawValPtr(),
                                           RHS.getRawValPtr());
   }
-};
-
-template <typename T> struct isPodLike<PoisoningVH<T>> {
-#ifdef NDEBUG
-  static const bool value = true;
-#else
-  static const bool value = false;
-#endif
 };
 
 } // end namespace llvm
